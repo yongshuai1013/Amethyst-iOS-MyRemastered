@@ -208,9 +208,6 @@ add_executable(AngelAuraAmethyst
   # TouchController bridge and preferences
   TouchControllerBridge.m
   TouchControllerPreferencesViewController.m
-
-  # Theme management
-  theme/ThemeManager.m
 )
 
 # Add ModLoaderIcons PNG files into the app bundle Resources/ModLoaderIcons so they are available at runtime.

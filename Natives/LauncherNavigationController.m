@@ -35,6 +35,13 @@ static void *ProgressObserverContext = &ProgressObserverContext;
 @property(nonatomic) UITextField* versionTextField;
 @property(nonatomic) int profileSelectedAt;
 
+- (void)themeChanged:(NSNotification *)note;
+- (void)applyTheme;
+
+@end
+
+@implementation LauncherNavigationController
+
 - (void)themeChanged:(NSNotification *)note {
     [self applyTheme];
 }
@@ -74,10 +81,6 @@ static void *ProgressObserverContext = &ProgressObserverContext;
         self.buttonInstall.backgroundColor = primary;
     }
 }
-
-@end
-
-@implementation LauncherNavigationController
 
 - (void)viewDidLoad
 {

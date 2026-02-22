@@ -339,7 +339,7 @@
         section.contentInsets = NSDirectionalEdgeInsetsMake(16, 16, 16, 16);
         return [[UICollectionViewCompositionalLayout alloc] initWithSection:section];
     } else {
-        NSCollectionLayoutListConfiguration *config = [[NSCollectionLayoutListConfiguration alloc] initWithAppearance:UICollectionLayoutListAppearanceSidebar];
+        UICollectionLayoutListConfiguration *config = [[UICollectionLayoutListConfiguration alloc] initWithAppearance:UICollectionLayoutListAppearanceSidebar];
         config.backgroundColor = [UIColor clearColor];
         config.showsSeparators = NO;
         return [UICollectionViewCompositionalLayout layoutWithListConfiguration:config];

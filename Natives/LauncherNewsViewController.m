@@ -6,6 +6,66 @@
 #import "utils.h"
 
 @interface LauncherNewsViewController()<WKNavigationDelegate>
+- (void)themeChanged:(NSNotification *)note;
+- (void)injectThemeCSS;
+- (NSString *)hexStringFromColor:(UIColor *)color;
+- (void)adjustWebViewForSize:(CGSize)size;
+@end
+
+@implementation LauncherNewsViewController {
+    WKWebView *webView;
+    UIEdgeInsets insets;
+}
+
+- (id)init {
+    self = [super init];
+    self.title = localize(@"News", nil);
+    return self;
+}
+
+- (NSString *)imageName {
+    return @"MenuNews";
+}
+
+- (void)viewDidLoad
+{
+    [super viewDidLoad];
+    
+    self.view.backgroundColor = [ThemeManager.sharedManager backgroundColor];
+    [[NSNotificationCenter defaultCenter] addObserver:self selector:@selector(themeChanged:) name:@"ThemeChangedNotification" object:nil];
+    insets = UIApplication.sharedApplication.windows.firstObject.safeAreaInsets;
+    
+    NSString *newsURL = getPrefObject(@"general.news_url") ?: @"https://amethyst.ct.ws/welcome";
+    NSURLRequest *request = [NSURLRequest requestWithURL:[NSURL URLWithString:newsURL]];
+
+    WKWebViewConfiguration *webConfig = [[WKWebViewConfiguration alloc] init];
+    webView = [[WKWebView alloc] initWithFrame:self.view.frame configuration:webConfig];
+    webView.autoresizingMask = UIViewAutoresizingFlexibleHeight | UIViewAutoresizingFlexibleWidth;
+    webView.translatesAutoresizingMaskIntoConstraints = NO;
+    webView.navigationDelegate = self;
+    webView.opaque = NO;
+    webView.scrollView.contentInsetAdjustmentBehavior = UIScrollViewContentInsetAdjustmentNever;
+    NSString *javascript = @"var meta = document.createElement('meta');meta.setAttribute('name', 'viewport');meta.setAttribute('content', 'width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no');document.getElementsByTagName('head')[0].appendChild(meta);";
+    WKUserScript *nozoom = [[WKUserScript alloc] initWithSource:javascript injectionTime:WKUserScriptInjectionTimeAtDocumentEnd forMainFrameOnly:YES];
+    [webView.configuration.userContentController addUserScript:nozoom];
+    [webView.scrollView setShowsHorizontalScrollIndicator:NO];
+    [webView loadRequest:request];
+    [self.view addSubview:webView];
+    
+    // Inject theme CSS
+    [self injectThemeCSS];
+    
+    CGSize size = CGSizeMake(self.view.frame.size.width, self.view.frame.size.height);
+    [self adjustWebViewForSize:size];
+    
+    // "This device has a limited amount of memory available."
+    [self showWarningAlert:@"limited_ram" hasPreference:YES exitWhenCompleted:NO];
+
+    self.navigationItem.leftBarButtonItem = self.splitViewController.displayModeButtonItem;
+    self.navigationItem.rightBarButtonItem = [sidebarViewController drawAccountButton];
+    self.navigationItem.leftItemsSupplementBackButton = true;
+}
+
 - (void)themeChanged:(NSNotification *)note {
     self.view.backgroundColor = [ThemeManager.sharedManager backgroundColor];
     [self injectThemeCSS];
@@ -41,61 +101,6 @@
 
 - (void)webView:(WKWebView *)webView didFinishNavigation:(WKNavigation *)navigation {
     [self injectThemeCSS];
-}
-
-@end
-
-@implementation LauncherNewsViewController
-WKWebView *webView;
-UIEdgeInsets insets;
-
-- (id)init {
-    self = [super init];
-    self.title = localize(@"News", nil);
-    return self;
-}
-
-- (NSString *)imageName {
-    return @"MenuNews";
-}
-
-- (void)viewDidLoad
-{
-    [super viewDidLoad];
-    
-    self.view.backgroundColor = [ThemeManager.sharedManager backgroundColor];
-    [[NSNotificationCenter defaultCenter] addObserver:self selector:@selector(themeChanged:) name:@"ThemeChangedNotification" object:nil];
-    insets = UIApplication.sharedApplication.windows.firstObject.safeAreaInsets;
-    
-    NSString *newsURL = getPrefObject(@"general.news_url") ?: @"https://amethyst.ct.ws/welcome";
-    NSURLRequest *request = [NSURLRequest requestWithURL:[NSURL URLWithString:newsURL]];
-
-    WKWebViewConfiguration *webConfig = [[WKWebViewConfiguration alloc] init];
-    webView = [[WKWebView alloc] initWithFrame:self.view.frame configuration:webConfig];
-    webView.autoresizingMask = UIViewAutoresizingFlexibleHeight | UIViewAutoresizingFlexibleWidth;
-    webView.translatesAutoresizingMaskIntoConstraints = NO;
-    webView.navigationDelegate = self;
-    webView.opaque = NO;
-    [self adjustWebViewForSize:size];
-    webView.scrollView.contentInsetAdjustmentBehavior = UIScrollViewContentInsetAdjustmentNever;
-    NSString *javascript = @"var meta = document.createElement('meta');meta.setAttribute('name', 'viewport');meta.setAttribute('content', 'width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no');document.getElementsByTagName('head')[0].appendChild(meta);";
-    WKUserScript *nozoom = [[WKUserScript alloc] initWithSource:javascript injectionTime:WKUserScriptInjectionTimeAtDocumentEnd forMainFrameOnly:YES];
-    [webView.configuration.userContentController addUserScript:nozoom];
-    [webView.scrollView setShowsHorizontalScrollIndicator:NO];
-    [webView loadRequest:request];
-    [self.view addSubview:webView];
-    
-    // Inject theme CSS
-    [self injectThemeCSS];
-    
-    CGSize size = CGSizeMake(self.view.frame.size.width, self.view.frame.size.height);
-        // "This device has a limited amount of memory available."
-        [self showWarningAlert:@"limited_ram" hasPreference:YES exitWhenCompleted:NO];
-    }
-
-    self.navigationItem.leftBarButtonItem = self.splitViewController.displayModeButtonItem;
-    self.navigationItem.rightBarButtonItem = [sidebarViewController drawAccountButton];
-    self.navigationItem.leftItemsSupplementBackButton = true;
 }
 
 -(void)showWarningAlert:(NSString *)key hasPreference:(BOOL)isPreferenced exitWhenCompleted:(BOOL)shouldExit {

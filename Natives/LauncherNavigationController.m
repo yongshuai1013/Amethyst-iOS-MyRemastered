@@ -7,6 +7,7 @@
 #import "JavaGUIViewController.h"
 #import "LauncherMenuViewController.h"
 #import "LauncherNavigationController.h"
+#import "theme/ThemeManager.h"
 #import "LauncherPreferences.h"
 #import "MinecraftResourceDownloadTask.h"
 #import "MinecraftResourceUtils.h"
@@ -34,6 +35,46 @@ static void *ProgressObserverContext = &ProgressObserverContext;
 @property(nonatomic) UITextField* versionTextField;
 @property(nonatomic) int profileSelectedAt;
 
+- (void)themeChanged:(NSNotification *)note {
+    [self applyTheme];
+}
+
+- (void)applyTheme {
+    UIColor *surface = [ThemeManager.sharedManager surfaceColor];
+    UIColor *primary = [ThemeManager.sharedManager primaryColor];
+    UIColor *text = [ThemeManager.sharedManager textColorPrimary];
+    
+    self.view.backgroundColor = [ThemeManager.sharedManager backgroundColor];
+    
+    self.navigationBar.barTintColor = surface;
+    self.navigationBar.tintColor = primary;
+    self.navigationBar.titleTextAttributes = @{NSForegroundColorAttributeName: text};
+    
+    if (@available(iOS 13.0, *)) {
+        UINavigationBarAppearance *appearance = [[UINavigationBarAppearance alloc] init];
+        [appearance configureWithOpaqueBackground];
+        appearance.backgroundColor = surface;
+        appearance.titleTextAttributes = @{NSForegroundColorAttributeName: text};
+        self.navigationBar.standardAppearance = appearance;
+        self.navigationBar.scrollEdgeAppearance = appearance;
+        
+        UIToolbarAppearance *toolbarAppearance = [[UIToolbarAppearance alloc] init];
+        [toolbarAppearance configureWithOpaqueBackground];
+        toolbarAppearance.backgroundColor = surface;
+        self.toolbar.standardAppearance = toolbarAppearance;
+        if (@available(iOS 15.0, *)) {
+            self.toolbar.scrollEdgeAppearance = toolbarAppearance;
+        }
+    }
+    
+    self.toolbar.barTintColor = surface;
+    self.toolbar.tintColor = primary;
+    
+    if (self.buttonInstall) {
+        self.buttonInstall.backgroundColor = primary;
+    }
+}
+
 @end
 
 @implementation LauncherNavigationController
@@ -41,6 +82,8 @@ static void *ProgressObserverContext = &ProgressObserverContext;
 - (void)viewDidLoad
 {
     [super viewDidLoad];
+    [[NSNotificationCenter defaultCenter] addObserver:self selector:@selector(themeChanged:) name:@"ThemeChangedNotification" object:nil];
+    [self applyTheme];
 
     if ([self respondsToSelector:@selector(setNeedsUpdateOfScreenEdgesDeferringSystemGestures)]) {
         [self setNeedsUpdateOfScreenEdgesDeferringSystemGestures];

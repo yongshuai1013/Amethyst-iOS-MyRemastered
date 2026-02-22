@@ -1,0 +1,32 @@
+{
+  "meta": {
+    "name": "Modern Dark",
+    "version": "1.0",
+    "author": "Amethyst Team"
+  },
+  "colors": {
+    "background": "#121212",
+    "surface": "#1E1E1E",
+    "primary": "#BB86FC",
+    "secondary": "#03DAC6",
+    "text_primary": "#FFFFFF",
+    "text_secondary": "#B0B0B0",
+    "accent": "#CF6679"
+  },
+  "layout": {
+    "style": "grid",
+    "corner_radius": 16,
+    "spacing": 12
+  },
+  "icons": {
+    "MenuCustomControls": "gamecontroller.fill",
+    "MenuInstallJar": "arrow.down.doc.fill",
+    "MenuNews": "newspaper.fill",
+    "MenuProfiles": "person.crop.circle.fill",
+    "MenuSettings": "gearshape.fill",
+    "AppLogo": "AppLogo"
+  },
+  "images": {
+    "background_url": "" 
+  }
+}

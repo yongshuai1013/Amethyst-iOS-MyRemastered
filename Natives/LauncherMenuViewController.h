@@ -9,8 +9,9 @@
 @property(nonatomic) NSArray<UIViewController *> *vcArray;
 @end
 
-@interface LauncherMenuViewController : UITableViewController
+@interface LauncherMenuViewController : UIViewController <UICollectionViewDelegate, UICollectionViewDataSource>
 
+@property (nonatomic, strong) UICollectionView *collectionView;
 @property NSString* listPath;
 @property(nonatomic) UIButton *accountButton;
 @property(nonatomic) UIBarButtonItem *accountBtnItem;

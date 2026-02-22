@@ -82,7 +82,7 @@
     [[NSNotificationCenter defaultCenter] postNotificationName:@"ThemeChangedNotification" object:nil];
 }
 
-- (void)loadTheme fromPath:(NSString *)path {
+- (void)loadThemeFromPath:(NSString *)path {
     NSData *data = [NSData dataWithContentsOfFile:path];
     if (data) {
         NSError *error;

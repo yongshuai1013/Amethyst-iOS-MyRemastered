@@ -17,7 +17,7 @@ typedef NS_ENUM(NSInteger, ThemeLayoutStyle) {
 
 + (instancetype)sharedManager;
 
-- (void)loadTheme fromPath:(NSString *)path;
+- (void)loadThemeFromPath:(NSString *)path;
 - (void)loadDefaultTheme;
 
 // Colors

@@ -149,6 +149,8 @@ add_executable(AngelAuraAmethyst
   input/GyroInput.m
   input/KeyboardInput.m
 
+  theme/ThemeManager.m
+
   AccountListViewController.m
   AppDelegate.m
   CustomControlsViewController.m
@@ -182,7 +184,6 @@ add_executable(AngelAuraAmethyst
   SurfaceViewController+ExternalDisplay.m
   SurfaceViewController+LogView.m
   SurfaceViewController+Navigation.m
-  ThemeManager.m
   TrackedTextField.m
   egl_bridge.m
   input_bridge_v3.m

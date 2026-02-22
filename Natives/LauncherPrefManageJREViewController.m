@@ -3,6 +3,7 @@
 #import "LauncherNavigationController.h"
 #import "LauncherPreferences.h"
 #import "LauncherPrefManageJREViewController.h"
+#import "theme/ThemeManager.h"
 #import "NSFileManager+NRFileManager.h"
 #import "UIKit+hook.h"
 #import "ios_uikit_bridge.h"
@@ -60,6 +61,9 @@ static WFWorkflowProgressView* currentProgressView;
 
     self.tableView = [[UITableView alloc] initWithFrame:CGRectZero style:UITableViewStyleInsetGrouped];
     self.tableView.keyboardDismissMode = UIScrollViewKeyboardDismissModeInteractive;
+    
+    [ThemeManager.sharedManager applyThemeToTableView:self.tableView];
+    [[NSNotificationCenter defaultCenter] addObserver:self selector:@selector(themeChanged:) name:@"ThemeChangedNotification" object:nil];
 
     self.javaRuntimes = @{
         @(DEFAULT_JRE): @[@"preference.manage_runtime.default.1165", @"preference.manage_runtime.default.117", @"launcher.menu.execute_jar"]
@@ -76,6 +80,11 @@ static WFWorkflowProgressView* currentProgressView;
 
     // Load WFWorkflowProgressView
     dlopen("/System/Library/PrivateFrameworks/WorkflowUIServices.framework/WorkflowUIServices", RTLD_GLOBAL);
+}
+
+- (void)themeChanged:(NSNotification *)note {
+    [ThemeManager.sharedManager applyThemeToTableView:self.tableView];
+    [self.tableView reloadData];
 }
 
 + (void)actionCancelImportRuntime {
@@ -159,6 +168,23 @@ static WFWorkflowProgressView* currentProgressView;
     }
 }
 
+- (UIView *)tableView:(UITableView *)tableView viewForHeaderInSection:(NSInteger)section {
+    NSString *title = [self tableView:tableView titleForHeaderInSection:section];
+    if (!title) return nil;
+    
+    UIView *headerView = [[UIView alloc] initWithFrame:CGRectMake(0, 0, tableView.bounds.size.width, 30)];
+    UILabel *headerLabel = [[UILabel alloc] initWithFrame:CGRectMake(20, 5, tableView.bounds.size.width - 40, 25)];
+    headerLabel.text = title;
+    headerLabel.font = [ThemeManager.sharedManager fontOfSize:14 weight:UIFontWeightBold];
+    headerLabel.textColor = [ThemeManager.sharedManager primaryColor];
+    [headerView addSubview:headerLabel];
+    return headerView;
+}
+
+- (CGFloat)tableView:(UITableView *)tableView heightForHeaderInSection:(NSInteger)section {
+    return 30;
+}
+
 - (NSString *)tableView:(UITableView *)tableView titleForFooterInSection:(NSInteger)section {
     switch (self.sortedJavaVersions[section].intValue) {
         case DEFAULT_JRE: return localize(@"preference.manage_runtime.footer.default", nil);
@@ -190,6 +216,8 @@ static WFWorkflowProgressView* currentProgressView;
     cell.textLabel.text = localize(self.javaRuntimes[@DEFAULT_JRE][indexPath.row], nil);
     cell.detailTextLabel.text = [NSString stringWithFormat:@"Java %@",
         ((NSDictionary *)self.selectedRuntimes[@"0"])[self.selectedRTTags[indexPath.row]]];
+    
+    [ThemeManager.sharedManager applyThemeToCell:cell];
     return cell;
 }
 
@@ -246,6 +274,7 @@ static WFWorkflowProgressView* currentProgressView;
         });
     });
 
+    [ThemeManager.sharedManager applyThemeToCell:cell];
     return cell;
 }
 

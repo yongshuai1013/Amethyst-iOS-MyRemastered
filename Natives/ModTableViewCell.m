@@ -1,6 +1,7 @@
 #import "ModTableViewCell.h"
 #import "ModItem.h"
 #import "ModService.h"
+#import "theme/ThemeManager.h"
 #import <QuartzCore/QuartzCore.h>
 
 #pragma clang diagnostic push
@@ -71,8 +72,26 @@
         [self.contentView addSubview:_openLinkButton];
 
         [self setupConstraints];
+        [self applyTheme];
     }
     return self;
+}
+
+- (void)applyTheme {
+    self.backgroundColor = [ThemeManager.sharedManager surfaceColor];
+    self.contentView.backgroundColor = [ThemeManager.sharedManager surfaceColor];
+    
+    _nameLabel.textColor = [ThemeManager.sharedManager textColorPrimary];
+    _descLabel.textColor = [ThemeManager.sharedManager textColorSecondary];
+    _authorLabel.textColor = [ThemeManager.sharedManager textColorSecondary];
+    _statsLabel.textColor = [ThemeManager.sharedManager textColorSecondary];
+    _modVersionLabel.textColor = [ThemeManager.sharedManager textColorSecondary];
+    
+    _downloadButton.backgroundColor = [ThemeManager.sharedManager primaryColor];
+    _enableSwitch.onTintColor = [ThemeManager.sharedManager primaryColor];
+    _openLinkButton.tintColor = [ThemeManager.sharedManager primaryColor];
+    
+    _modIconView.backgroundColor = [[ThemeManager.sharedManager secondaryColor] colorWithAlphaComponent:0.1];
 }
 
 #pragma mark - UI Element Factory Methods

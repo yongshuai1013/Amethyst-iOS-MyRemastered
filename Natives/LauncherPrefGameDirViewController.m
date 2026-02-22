@@ -1,6 +1,7 @@
 #import "LauncherNavigationController.h"
 #import "LauncherPreferences.h"
 #import "LauncherPrefGameDirViewController.h"
+#import "theme/ThemeManager.h"
 #import "NSFileManager+NRFileManager.h"
 #import "PLProfiles.h"
 #import "ios_uikit_bridge.h"
@@ -24,6 +25,9 @@
     self.tableView.keyboardDismissMode = UIScrollViewKeyboardDismissModeInteractive;
     self.tableView.sectionFooterHeight = 50;
 
+    [ThemeManager.sharedManager applyThemeToTableView:self.tableView];
+    [[NSNotificationCenter defaultCenter] addObserver:self selector:@selector(themeChanged:) name:@"ThemeChangedNotification" object:nil];
+    
     NSString *path = [NSString stringWithFormat:@"%s/instances", getenv("POJAV_HOME")];
 
     NSFileManager *fm = NSFileManager.defaultManager;
@@ -48,6 +52,11 @@
     [NSFileManager.defaultManager changeCurrentDirectoryPath:lasmPath];
     toggleIsolatedPref(NO);
     [self.navigationController performSelector:@selector(reloadProfileList)];
+}
+
+- (void)themeChanged:(NSNotification *)note {
+    [ThemeManager.sharedManager applyThemeToTableView:self.tableView];
+    [self.tableView reloadData];
 }
 
 - (NSInteger)tableView:(UITableView *)tableView numberOfRowsInSection:(NSInteger)section
@@ -77,6 +86,12 @@
     view.text = self.array[indexPath.row];
     cell.textLabel.hidden = YES;
     cell.textLabel.text = view.text;
+    
+    [ThemeManager.sharedManager applyThemeToCell:cell];
+    [ThemeManager.sharedManager applyThemeToTextField:view];
+    // TextField in cell might need clear background if cell has color
+    view.backgroundColor = [UIColor clearColor];
+    view.borderStyle = UITextBorderStyleNone;
 
     // Calculate the instance size
     dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
@@ -107,6 +122,15 @@ viewForFooterInSection:(NSInteger)section
     view.delegate = self;
     view.placeholder = localize(@"preference.multidir.add_directory", nil);
     view.returnKeyType = UIReturnKeyDone;
+    
+    view.backgroundColor = [ThemeManager.sharedManager surfaceColor];
+    view.textColor = [ThemeManager.sharedManager textColorPrimary];
+    view.layer.cornerRadius = [ThemeManager.sharedManager cornerRadius];
+    // Add padding
+    UIView *paddingView = [[UIView alloc] initWithFrame:CGRectMake(0, 0, 10, 20)];
+    view.leftView = paddingView;
+    view.leftViewMode = UITextFieldViewModeAlways;
+    
     return view;
 }
 

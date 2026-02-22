@@ -1,4 +1,5 @@
 #import "ModVersionViewController.h"
+#import "theme/ThemeManager.h"
 #import "installer/modpack/ModrinthAPI.h"
 #import "ModVersion.h"
 #import "ModVersionTableViewCell.h"
@@ -32,6 +33,24 @@
     [self setupActivityIndicator];
 
     [self fetchVersions];
+    
+    [[NSNotificationCenter defaultCenter] addObserver:self selector:@selector(themeChanged:) name:@"ThemeChangedNotification" object:nil];
+}
+
+- (void)themeChanged:(NSNotification *)note {
+    self.view.backgroundColor = [ThemeManager.sharedManager backgroundColor];
+    [ThemeManager.sharedManager applyThemeToTableView:self.tableView];
+    [self.tableView reloadData];
+    
+    // Re-theme filter buttons
+    UIColor *btnBg = [ThemeManager.sharedManager surfaceColor];
+    UIColor *btnText = [ThemeManager.sharedManager primaryColor];
+    
+    self.gameVersionFilterButton.backgroundColor = btnBg;
+    [self.gameVersionFilterButton setTitleColor:btnText forState:UIControlStateNormal];
+    
+    self.loaderFilterButton.backgroundColor = btnBg;
+    [self.loaderFilterButton setTitleColor:btnText forState:UIControlStateNormal];
 }
 
 - (void)setupFilterControls {
@@ -58,8 +77,9 @@
     button.translatesAutoresizingMaskIntoConstraints = NO;
     [button setTitle:title forState:UIControlStateNormal];
     button.layer.cornerRadius = 8;
-    button.backgroundColor = [UIColor secondarySystemBackgroundColor];
-    button.showsMenuAsPrimaryAction = YES; // This is the key for UIMenu
+    button.backgroundColor = [ThemeManager.sharedManager surfaceColor];
+    [button setTitleColor:[ThemeManager.sharedManager primaryColor] forState:UIControlStateNormal];
+    button.showsMenuAsPrimaryAction = YES;
     return button;
 }
 
@@ -68,6 +88,7 @@
     self.tableView.translatesAutoresizingMaskIntoConstraints = NO;
     self.tableView.dataSource = self;
     self.tableView.delegate = self;
+    [ThemeManager.sharedManager applyThemeToTableView:self.tableView];
     [self.tableView registerClass:[ModVersionTableViewCell class] forCellReuseIdentifier:@"ModVersionCell"];
     [self.view addSubview:self.tableView];
 
@@ -200,6 +221,7 @@
     ModVersionTableViewCell *cell = [tableView dequeueReusableCellWithIdentifier:@"ModVersionCell" forIndexPath:indexPath];
     ModVersion *version = self.filteredVersions[indexPath.row];
     [cell configureWithVersion:version];
+    [cell applyTheme];
     return cell;
 }
 

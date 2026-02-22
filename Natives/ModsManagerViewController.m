@@ -1,4 +1,5 @@
 #import "ModsManagerViewController.h"
+#import "theme/ThemeManager.h"
 #import "ModTableViewCell.h"
 #import "ModService.h"
 #import "ModItem.h"
@@ -25,13 +26,22 @@
 - (void)viewDidLoad {
     [super viewDidLoad];
     self.title = @"管理 Mod";
-    self.view.backgroundColor = [UIColor systemBackgroundColor];
+    self.view.backgroundColor = [ThemeManager.sharedManager backgroundColor];
     self.currentMode = ModsManagerModeLocal;
     self.localMods = [NSMutableArray array];
     self.filteredLocalMods = [NSMutableArray array];
     self.onlineSearchResults = [NSMutableArray array];
+    
     [self setupUI];
     [self refreshLocalModsList];
+    [[NSNotificationCenter defaultCenter] addObserver:self selector:@selector(themeChanged:) name:@"ThemeChangedNotification" object:nil];
+}
+
+- (void)themeChanged:(NSNotification *)note {
+    self.view.backgroundColor = [ThemeManager.sharedManager backgroundColor];
+    [ThemeManager.sharedManager applyThemeToTableView:self.tableView];
+    self.searchBar.barTintColor = [ThemeManager.sharedManager surfaceColor];
+    [self.tableView reloadData];
 }
 
 - (void)setupUI {
@@ -50,9 +60,17 @@
     [self.tableView registerClass:[ModTableViewCell class] forCellReuseIdentifier:@"ModCell"];
     self.tableView.dataSource = self;
     self.tableView.delegate = self;
-    self.tableView.rowHeight = 50;
+    self.tableView.rowHeight = 80;
     self.tableView.tableFooterView = [UIView new];
+    [ThemeManager.sharedManager applyThemeToTableView:self.tableView];
     [self.view addSubview:self.tableView];
+    
+    self.searchBar.backgroundImage = [[UIImage alloc] init];
+    self.searchBar.barTintColor = [ThemeManager.sharedManager surfaceColor];
+    if (@available(iOS 13.0, *)) {
+        self.searchBar.searchTextField.backgroundColor = [ThemeManager.sharedManager backgroundColor];
+        self.searchBar.searchTextField.textColor = [ThemeManager.sharedManager textColorPrimary];
+    }
     UIRefreshControl *rc = [UIRefreshControl new];
     [rc addTarget:self action:@selector(handleRefresh:) forControlEvents:UIControlEventValueChanged];
     self.tableView.refreshControl = rc;
@@ -247,6 +265,7 @@
 - (UITableViewCell *)tableView:(UITableView *)tableView cellForRowAtIndexPath:(NSIndexPath *)indexPath {
     ModTableViewCell *cell = [tableView dequeueReusableCellWithIdentifier:@"ModCell" forIndexPath:indexPath];
     cell.delegate = self;
+    [cell applyTheme];
 
     if (self.currentMode == ModsManagerModeLocal) {
         ModItem *mod = self.filteredLocalMods[indexPath.row];

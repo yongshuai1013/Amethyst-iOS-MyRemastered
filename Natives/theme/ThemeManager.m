@@ -212,4 +212,50 @@
     }];
 }
 
+#pragma mark - Components
+
+- (void)applyThemeToTableView:(UITableView *)tableView {
+    tableView.backgroundColor = [self backgroundColor];
+    tableView.separatorColor = [[self secondaryColor] colorWithAlphaComponent:0.3];
+    tableView.indicatorStyle = UIScrollViewIndicatorStyleWhite;
+}
+
+- (void)applyThemeToCell:(UITableViewCell *)cell {
+    cell.backgroundColor = [self surfaceColor];
+    cell.textLabel.textColor = [self textColorPrimary];
+    cell.detailTextLabel.textColor = [self textColorSecondary];
+    cell.tintColor = [self primaryColor];
+    
+    // Modernize cell appearance
+    UIView *selectedBackgroundView = [[UIView alloc] init];
+    selectedBackgroundView.backgroundColor = [[self primaryColor] colorWithAlphaComponent:0.2];
+    cell.selectedBackgroundView = selectedBackgroundView;
+}
+
+- (void)applyThemeToLabel:(UILabel *)label {
+    label.textColor = [self textColorPrimary];
+}
+
+- (void)applyThemeToButton:(UIButton *)button {
+    button.backgroundColor = [self primaryColor];
+    [button setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
+    button.layer.cornerRadius = [self cornerRadius];
+    button.layer.masksToBounds = YES;
+}
+
+- (void)applyThemeToSwitch:(UISwitch *)switchControl {
+    switchControl.onTintColor = [self primaryColor];
+}
+
+- (void)applyThemeToTextField:(UITextField *)textField {
+    textField.backgroundColor = [self surfaceColor];
+    textField.textColor = [self textColorPrimary];
+    textField.tintColor = [self primaryColor];
+    
+    // Add border if needed
+    textField.layer.borderColor = [[self secondaryColor] colorWithAlphaComponent:0.3].CGColor;
+    textField.layer.borderWidth = 1.0;
+    textField.layer.cornerRadius = [self cornerRadius];
+}
+
 @end

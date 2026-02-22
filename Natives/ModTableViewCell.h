@@ -41,6 +41,7 @@ typedef NS_ENUM(NSInteger, ModTableViewCellDisplayMode) {
 
 // --- State Updates ---
 - (void)updateToggleState:(BOOL)disabled;
+- (void)applyTheme;
 
 @end
 

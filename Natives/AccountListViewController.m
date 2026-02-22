@@ -3,6 +3,7 @@
 #import "authenticator/BaseAuthenticator.h"
 #import "authenticator/ThirdPartyAuthenticator.h"
 #import "AccountListViewController.h"
+#import "theme/ThemeManager.h"
 #import "AFNetworking.h"
 #import "LauncherPreferences.h"
 #import "UIImageView+AFNetworking.h"
@@ -41,6 +42,13 @@
     }
 
     [self.tableView setSeparatorStyle:UITableViewCellSeparatorStyleSingleLine];
+    [ThemeManager.sharedManager applyThemeToTableView:self.tableView];
+    [[NSNotificationCenter defaultCenter] addObserver:self selector:@selector(themeChanged:) name:@"ThemeChangedNotification" object:nil];
+}
+
+- (void)themeChanged:(NSNotification *)note {
+    [ThemeManager.sharedManager applyThemeToTableView:self.tableView];
+    [self.tableView reloadData];
 }
 
 - (NSInteger)tableView:(UITableView *)tableView numberOfRowsInSection:(NSInteger)section
@@ -59,6 +67,9 @@
     if (indexPath.row == self.accountList.count) {
         cell.imageView.image = [UIImage imageNamed:@"IconAdd"];
         cell.textLabel.text = localize(@"login.option.add", nil);
+        [ThemeManager.sharedManager applyThemeToCell:cell];
+        cell.textLabel.textColor = [ThemeManager.sharedManager primaryColor];
+        cell.imageView.tintColor = [ThemeManager.sharedManager primaryColor];
         return cell;
     }
 
@@ -82,6 +93,7 @@
     cell.imageView.contentMode = UIViewContentModeCenter;
     [cell.imageView setImageWithURL:[NSURL URLWithString:[selected[@"profilePicURL"] stringByReplacingOccurrencesOfString:@"\\/" withString:@"/"]] placeholderImage:[UIImage imageNamed:@"DefaultAccount"]];
 
+    [ThemeManager.sharedManager applyThemeToCell:cell];
     return cell;
 }
 

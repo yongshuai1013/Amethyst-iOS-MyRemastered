@@ -2,6 +2,7 @@
 #import <objc/runtime.h>
 #import "DownloadProgressViewController.h"
 #import "WFWorkflowProgressView.h"
+#import "theme/ThemeManager.h"
 
 static void *CellProgressObserverContext = &CellProgressObserverContext;
 static void *TotalProgressObserverContext = &TotalProgressObserverContext;
@@ -25,6 +26,9 @@ static void *TotalProgressObserverContext = &TotalProgressObserverContext;
 
     // Load WFWorkflowProgressView
     dlopen("/System/Library/PrivateFrameworks/WorkflowUIServices.framework/WorkflowUIServices", RTLD_GLOBAL);
+
+    [ThemeManager.sharedManager applyThemeToTableView:self.tableView];
+    self.view.tintColor = [ThemeManager.sharedManager primaryColor];
 }
 - (void)viewDidAppear:(BOOL)animated {
     [super viewDidAppear:animated];
@@ -115,6 +119,7 @@ static void *TotalProgressObserverContext = &TotalProgressObserverContext;
 
     cell.textLabel.text = self.task.fileList[indexPath.row];
     cell.detailTextLabel.text = progress.localizedAdditionalDescription;
+    [ThemeManager.sharedManager applyThemeToCell:cell];
     return cell;
 }
 

@@ -5,6 +5,7 @@
 #import "LauncherPrefManageJREViewController.h"
 #import "LauncherProfileEditorViewController.h"
 #import "LauncherProfilesViewController.h"
+#import "theme/ThemeManager.h"
 #import "PLProfiles.h"
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wunguarded-availability-new"
@@ -74,6 +75,11 @@ typedef NS_ENUM(NSUInteger, LauncherProfilesTableSection) {
 
     self.tableView = [[UITableView alloc] initWithFrame:CGRectZero style:UITableViewStyleInsetGrouped];
     self.tableView.keyboardDismissMode = UIScrollViewKeyboardDismissModeInteractive;
+    [[NSNotificationCenter defaultCenter] addObserver:self selector:@selector(themeChanged:) name:@"ThemeChangedNotification" object:nil];
+}
+
+- (void)themeChanged:(NSNotification *)note {
+    [self.tableView reloadData];
 }
 
 - (void)viewWillAppear:(BOOL)animated {
@@ -84,6 +90,7 @@ typedef NS_ENUM(NSUInteger, LauncherProfilesTableSection) {
     [PLProfiles updateCurrent];
     [self.tableView reloadData];
     [self.navigationController performSelector:@selector(reloadProfileList)];
+    [ThemeManager.sharedManager applyThemeToTableView:self.tableView];
 }
 
 - (void)actionTogglePrefIsolation:(UISwitch *)sender {
@@ -135,6 +142,23 @@ typedef NS_ENUM(NSUInteger, LauncherProfilesTableSection) {
 
 - (NSInteger)numberOfSectionsInTableView:(UITableView *)tableView {
     return 2;
+}
+
+- (UIView *)tableView:(UITableView *)tableView viewForHeaderInSection:(NSInteger)section {
+    NSString *title = [self tableView:tableView titleForHeaderInSection:section];
+    if (!title) return nil;
+    
+    UIView *headerView = [[UIView alloc] initWithFrame:CGRectMake(0, 0, tableView.bounds.size.width, 30)];
+    UILabel *headerLabel = [[UILabel alloc] initWithFrame:CGRectMake(20, 5, tableView.bounds.size.width - 40, 25)];
+    headerLabel.text = title;
+    headerLabel.font = [ThemeManager.sharedManager fontOfSize:14 weight:UIFontWeightBold];
+    headerLabel.textColor = [ThemeManager.sharedManager primaryColor];
+    [headerView addSubview:headerLabel];
+    return headerView;
+}
+
+- (CGFloat)tableView:(UITableView *)tableView heightForHeaderInSection:(NSInteger)section {
+    return 30;
 }
 
 - (NSString *)tableView:(UITableView *)tableView titleForHeaderInSection:(NSInteger)section {
@@ -212,6 +236,16 @@ typedef NS_ENUM(NSUInteger, LauncherProfilesTableSection) {
         [self setupInstanceCell:cell atRow:indexPath.row];
     } else {
         [self setupProfileCell:cell atRow:indexPath.row];
+    }
+
+    [ThemeManager.sharedManager applyThemeToCell:cell];
+    if (cell.accessoryView && [cell.accessoryView isKindOfClass:[UISwitch class]]) {
+        [ThemeManager.sharedManager applyThemeToSwitch:(UISwitch *)cell.accessoryView];
+    }
+    
+    // Customization for Instance cells
+    if (indexPath.section == kInstances) {
+        cell.imageView.tintColor = [ThemeManager.sharedManager primaryColor];
     }
 
     cell.textLabel.enabled = cell.detailTextLabel.enabled = cell.userInteractionEnabled;

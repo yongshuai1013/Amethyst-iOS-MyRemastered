@@ -6,6 +6,7 @@ NS_ASSUME_NONNULL_BEGIN
 @interface ModVersionTableViewCell : UITableViewCell
 
 - (void)configureWithVersion:(ModVersion *)version;
+- (void)applyTheme;
 
 @end
 

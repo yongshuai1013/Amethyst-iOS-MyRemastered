@@ -1,10 +1,48 @@
 #import <WebKit/WebKit.h>
 #import "LauncherMenuViewController.h"
+#import "theme/ThemeManager.h"
 #import "LauncherNewsViewController.h"
 #import "LauncherPreferences.h"
 #import "utils.h"
 
 @interface LauncherNewsViewController()<WKNavigationDelegate>
+- (void)themeChanged:(NSNotification *)note {
+    self.view.backgroundColor = [ThemeManager.sharedManager backgroundColor];
+    [self injectThemeCSS];
+}
+
+- (void)injectThemeCSS {
+    // Basic dark mode injection for web content if possible
+    // This is a best-effort attempt to style the webview content
+    NSString *hexBg = [self hexStringFromColor:[ThemeManager.sharedManager backgroundColor]];
+    NSString *hexText = [self hexStringFromColor:[ThemeManager.sharedManager textColorPrimary]];
+    
+    NSString *css = [NSString stringWithFormat:
+                     @"body { background-color: %@ !important; color: %@ !important; }"
+                     "a { color: %@ !important; }",
+                     hexBg, hexText, [self hexStringFromColor:[ThemeManager.sharedManager primaryColor]]];
+    
+    NSString *js = [NSString stringWithFormat:
+                    @"var style = document.createElement('style');"
+                    "style.innerHTML = '%@';"
+                    "document.head.appendChild(style);", css];
+    
+    [webView evaluateJavaScript:js completionHandler:nil];
+}
+
+- (NSString *)hexStringFromColor:(UIColor *)color {
+    const CGFloat *components = CGColorGetComponents(color.CGColor);
+    CGFloat r = components[0];
+    CGFloat g = components[1];
+    CGFloat b = components[2];
+    return [NSString stringWithFormat:@"#%02lX%02lX%02lX",
+            lroundf(r * 255), lroundf(g * 255), lroundf(b * 255)];
+}
+
+- (void)webView:(WKWebView *)webView didFinishNavigation:(WKNavigation *)navigation {
+    [self injectThemeCSS];
+}
+
 @end
 
 @implementation LauncherNewsViewController
@@ -25,7 +63,8 @@ UIEdgeInsets insets;
 {
     [super viewDidLoad];
     
-    CGSize size = CGSizeMake(self.view.frame.size.width, self.view.frame.size.height);
+    self.view.backgroundColor = [ThemeManager.sharedManager backgroundColor];
+    [[NSNotificationCenter defaultCenter] addObserver:self selector:@selector(themeChanged:) name:@"ThemeChangedNotification" object:nil];
     insets = UIApplication.sharedApplication.windows.firstObject.safeAreaInsets;
     
     NSString *newsURL = getPrefObject(@"general.news_url") ?: @"https://amethyst.ct.ws/welcome";
@@ -45,8 +84,11 @@ UIEdgeInsets insets;
     [webView.scrollView setShowsHorizontalScrollIndicator:NO];
     [webView loadRequest:request];
     [self.view addSubview:webView];
-
-    if(!isJailbroken && getPrefBool(@"warnings.limited_ram_warn") && (roundf(NSProcessInfo.processInfo.physicalMemory / 0x1000000) < 3900)) {
+    
+    // Inject theme CSS
+    [self injectThemeCSS];
+    
+    CGSize size = CGSizeMake(self.view.frame.size.width, self.view.frame.size.height);
         // "This device has a limited amount of memory available."
         [self showWarningAlert:@"limited_ram" hasPreference:YES exitWhenCompleted:NO];
     }

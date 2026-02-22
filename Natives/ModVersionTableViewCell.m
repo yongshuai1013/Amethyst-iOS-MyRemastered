@@ -1,4 +1,6 @@
 #import "ModVersionTableViewCell.h"
+#import "theme/ThemeManager.h"
+#import "ModVersion.h"
 
 @interface ModVersionTableViewCell ()
 @property (nonatomic, strong) UILabel *nameLabel;
@@ -16,8 +18,21 @@
     self = [super initWithStyle:style reuseIdentifier:reuseIdentifier];
     if (self) {
         [self setupUI];
+        [self applyTheme];
     }
     return self;
+}
+
+- (void)applyTheme {
+    self.backgroundColor = [ThemeManager.sharedManager surfaceColor];
+    self.contentView.backgroundColor = [ThemeManager.sharedManager surfaceColor];
+    
+    self.nameLabel.textColor = [ThemeManager.sharedManager textColorPrimary];
+    self.versionNumberLabel.textColor = [ThemeManager.sharedManager textColorSecondary];
+    
+    self.datePublishedLabel.textColor = [ThemeManager.sharedManager textColorSecondary];
+    self.fileSizeLabel.textColor = [ThemeManager.sharedManager textColorSecondary];
+    self.gameVersionsLabel.textColor = [ThemeManager.sharedManager textColorSecondary];
 }
 
 - (void)setupUI {

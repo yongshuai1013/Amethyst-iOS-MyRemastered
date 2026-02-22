@@ -40,6 +40,14 @@ typedef NS_ENUM(NSInteger, ThemeLayoutStyle) {
 - (void)applyEntranceAnimationToView:(UIView *)view delay:(NSTimeInterval)delay;
 - (void)applyPressAnimationToView:(UIView *)view;
 
+// Components
+- (void)applyThemeToTableView:(UITableView *)tableView;
+- (void)applyThemeToCell:(UITableViewCell *)cell;
+- (void)applyThemeToLabel:(UILabel *)label;
+- (void)applyThemeToButton:(UIButton *)button;
+- (void)applyThemeToSwitch:(UISwitch *)switchControl;
+- (void)applyThemeToTextField:(UITextField *)textField;
+
 @end
 
 NS_ASSUME_NONNULL_END

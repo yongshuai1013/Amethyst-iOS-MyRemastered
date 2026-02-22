@@ -5,6 +5,7 @@
 #import "LauncherNavigationController.h"
 #import "LauncherMenuViewController.h"
 #import "LauncherPreferences.h"
+#import "theme/ThemeManager.h"
 #import "PLPrefTableViewController.h"
 #import "UIKit+hook.h"
 
@@ -40,6 +41,14 @@
         // Display one singe section if prefSection is unspecified
         self.prefSectionsVisibility = (id)@[@YES];
     }
+    
+    [ThemeManager.sharedManager applyThemeToTableView:self.tableView];
+    [[NSNotificationCenter defaultCenter] addObserver:self selector:@selector(themeChanged:) name:@"ThemeChangedNotification" object:nil];
+}
+
+- (void)themeChanged:(NSNotification *)note {
+    [ThemeManager.sharedManager applyThemeToTableView:self.tableView];
+    [self.tableView reloadData];
 }
 
 - (UIBarButtonItem *)drawHelpButton {
@@ -125,6 +134,8 @@
         key = self.prefSections[indexPath.section];
         cell.selectionStyle = UITableViewCellSelectionStyleDefault;
         cell.textLabel.text = localize(([NSString stringWithFormat:@"preference.section.%@", key]), nil);
+        cell.textLabel.font = [ThemeManager.sharedManager fontOfSize:16 weight:UIFontWeightBold];
+        cell.textLabel.textColor = [ThemeManager.sharedManager primaryColor];
     } else {
         CreateView createView = item[@"type"];
         createView(cell, self.prefSections[indexPath.section], key, item);
@@ -154,6 +165,21 @@
     cell.userInteractionEnabled = !checkEnable || checkEnable();
     cell.textLabel.enabled = cell.detailTextLabel.enabled = cell.userInteractionEnabled;
     [(id)cell.accessoryView setEnabled:cell.userInteractionEnabled];
+    
+    // Theme
+    [ThemeManager.sharedManager applyThemeToCell:cell];
+    if ([cell.accessoryView isKindOfClass:[UISwitch class]]) {
+        [ThemeManager.sharedManager applyThemeToSwitch:(UISwitch *)cell.accessoryView];
+    } else if ([cell.accessoryView isKindOfClass:[UITextField class]]) {
+        [ThemeManager.sharedManager applyThemeToTextField:(UITextField *)cell.accessoryView];
+    } else if ([cell.accessoryView isKindOfClass:[DBNumberedSlider class]]) {
+        ((DBNumberedSlider *)cell.accessoryView).tintColor = [ThemeManager.sharedManager primaryColor];
+    }
+    
+    if (destructive) {
+        cell.textLabel.textColor = [UIColor systemRedColor];
+        cell.imageView.tintColor = [UIColor systemRedColor];
+    }
 
     return cell;
 }

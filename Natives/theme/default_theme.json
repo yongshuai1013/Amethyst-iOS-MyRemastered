@@ -2,7 +2,7 @@
   "meta": {
     "name": "Modern Dark",
     "version": "1.0",
-    "author": "Amethyst Team"
+    "author": "herbrine8403"
   },
   "colors": {
     "background": "#121212",
@@ -30,3 +30,4 @@
     "background_url": "" 
   }
 }
+

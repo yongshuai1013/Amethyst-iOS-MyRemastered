@@ -1,6 +1,6 @@
 #import "LauncherRightPanelViewController.h"
 #import "authenticator/BaseAuthenticator.h"
-#import "LauncherProfilesViewController.h"
+#import "CustomControlsViewController.h"
 #import "AccountListViewController.h"
 #import "SurfaceViewController.h"
 #import "PLProfiles.h"
@@ -176,7 +176,7 @@ extern void setPrefInt(NSString *key, NSInteger value);
 }
 
 - (void)showVersionManager {
-    LauncherProfilesViewController *vc = [[LauncherProfilesViewController alloc] init];
+    CustomControlsViewController *vc = [[CustomControlsViewController alloc] init];
     UINavigationController *nav = [[UINavigationController alloc] initWithRootViewController:vc];
     nav.modalPresentationStyle = UIModalPresentationFormSheet;
     [self presentViewController:nav animated:YES completion:nil];

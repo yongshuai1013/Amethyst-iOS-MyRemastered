@@ -360,17 +360,25 @@
 #pragma mark - Loader Selection View Controller
 
 @interface LoaderSelectionViewController : UIViewController <UITableViewDataSource, UITableViewDelegate>
-@property (nonatomic, copy) void (^completion)(NSString *loader, BOOL installFabricAPI, BOOL installOptiFine);
+@property (nonatomic, copy) void (^completion)(NSString *loader, BOOL installFabricAPI, BOOL installOptiFine, NSString *fabricAPIVersion, NSString *optiFineVersion);
 @property (nonatomic, strong) NSArray *loaders;
 @property (nonatomic, strong) UITableView *tableView;
 @property (nonatomic, strong) UIView *optionsContainer;
+@property (nonatomic, strong) UIView *fabricAPIRow;
+@property (nonatomic, strong) UIView *optiFineRow;
 @property (nonatomic, strong) UISwitch *fabricAPISwitch;
 @property (nonatomic, strong) UISwitch *optiFineSwitch;
 @property (nonatomic, strong) UILabel *fabricAPILabel;
 @property (nonatomic, strong) UILabel *optiFineLabel;
+@property (nonatomic, strong) UIButton *fabricAPIVersionButton;
+@property (nonatomic, strong) UIButton *optiFineVersionButton;
 @property (nonatomic, strong) UIButton *installButton;
 @property (nonatomic, strong) NSString *selectedLoader;
 @property (nonatomic, strong) NSString *gameVersion;
+@property (nonatomic, strong) NSString *selectedFabricAPIVersion;
+@property (nonatomic, strong) NSString *selectedOptiFineVersion;
+@property (nonatomic, strong) NSArray *fabricAPIVersions;
+@property (nonatomic, strong) NSArray *optiFineVersions;
 @end
 
 @implementation LoaderSelectionViewController
@@ -421,33 +429,88 @@
     self.optionsContainer.hidden = YES;
     [self.view addSubview:self.optionsContainer];
     
+    // Fabric API option row
+    self.fabricAPIRow = [[UIView alloc] init];
+    self.fabricAPIRow.translatesAutoresizingMaskIntoConstraints = NO;
+    [self.optionsContainer addSubview:self.fabricAPIRow];
+    
     self.fabricAPILabel = [[UILabel alloc] init];
     self.fabricAPILabel.translatesAutoresizingMaskIntoConstraints = NO;
     self.fabricAPILabel.text = @"同时安装 Fabric API";
     self.fabricAPILabel.font = [UIFont systemFontOfSize:16 weight:UIFontWeightMedium];
     self.fabricAPILabel.textColor = [UIColor labelColor];
-    self.fabricAPILabel.hidden = YES;
-    [self.optionsContainer addSubview:self.fabricAPILabel];
+    [self.fabricAPIRow addSubview:self.fabricAPILabel];
     
     self.fabricAPISwitch = [[UISwitch alloc] init];
     self.fabricAPISwitch.translatesAutoresizingMaskIntoConstraints = NO;
     self.fabricAPISwitch.on = YES;
-    self.fabricAPISwitch.hidden = YES;
-    [self.optionsContainer addSubview:self.fabricAPISwitch];
+    [self.fabricAPISwitch addTarget:self action:@selector(fabricAPISwitchChanged:) forControlEvents:UIControlEventValueChanged];
+    [self.fabricAPIRow addSubview:self.fabricAPISwitch];
+    
+    self.fabricAPIVersionButton = [UIButton buttonWithType:UIButtonTypeSystem];
+    self.fabricAPIVersionButton.translatesAutoresizingMaskIntoConstraints = NO;
+    [self.fabricAPIVersionButton setTitle:@"最新版本" forState:UIControlStateNormal];
+    self.fabricAPIVersionButton.titleLabel.font = [UIFont systemFontOfSize:14 weight:UIFontWeightRegular];
+    self.fabricAPIVersionButton.tintColor = [UIColor systemBlueColor];
+    [self.fabricAPIVersionButton addTarget:self action:@selector(showFabricAPIVersionPicker) forControlEvents:UIControlEventTouchUpInside];
+    [self.fabricAPIRow addSubview:self.fabricAPIVersionButton];
+    
+    [NSLayoutConstraint activateConstraints:@[
+        [self.fabricAPILabel.leadingAnchor constraintEqualToAnchor:self.fabricAPIRow.leadingAnchor constant:16],
+        [self.fabricAPILabel.centerYAnchor constraintEqualToAnchor:self.fabricAPIRow.centerYAnchor],
+        [self.fabricAPISwitch.trailingAnchor constraintEqualToAnchor:self.fabricAPIRow.trailingAnchor constant:-16],
+        [self.fabricAPISwitch.centerYAnchor constraintEqualToAnchor:self.fabricAPIRow.centerYAnchor],
+        [self.fabricAPIVersionButton.trailingAnchor constraintEqualToAnchor:self.fabricAPISwitch.leadingAnchor constant:-8],
+        [self.fabricAPIVersionButton.centerYAnchor constraintEqualToAnchor:self.fabricAPIRow.centerYAnchor],
+        [self.fabricAPIRow.topAnchor constraintEqualToAnchor:self.optionsContainer.topAnchor],
+        [self.fabricAPIRow.leadingAnchor constraintEqualToAnchor:self.optionsContainer.leadingAnchor],
+        [self.fabricAPIRow.trailingAnchor constraintEqualToAnchor:self.optionsContainer.trailingAnchor],
+        [self.fabricAPIRow.heightAnchor constraintEqualToConstant:44]
+    ]];
+    
+    // OptiFine option row
+    self.optiFineRow = [[UIView alloc] init];
+    self.optiFineRow.translatesAutoresizingMaskIntoConstraints = NO;
+    [self.optionsContainer addSubview:self.optiFineRow];
     
     self.optiFineLabel = [[UILabel alloc] init];
     self.optiFineLabel.translatesAutoresizingMaskIntoConstraints = NO;
     self.optiFineLabel.text = @"同时安装 OptiFine";
     self.optiFineLabel.font = [UIFont systemFontOfSize:16 weight:UIFontWeightMedium];
     self.optiFineLabel.textColor = [UIColor labelColor];
-    self.optiFineLabel.hidden = YES;
-    [self.optionsContainer addSubview:self.optiFineLabel];
+    [self.optiFineRow addSubview:self.optiFineLabel];
     
     self.optiFineSwitch = [[UISwitch alloc] init];
     self.optiFineSwitch.translatesAutoresizingMaskIntoConstraints = NO;
     self.optiFineSwitch.on = NO;
-    self.optiFineSwitch.hidden = YES;
-    [self.optionsContainer addSubview:self.optiFineSwitch];
+    [self.optiFineSwitch addTarget:self action:@selector(optiFineSwitchChanged:) forControlEvents:UIControlEventValueChanged];
+    [self.optiFineRow addSubview:self.optiFineSwitch];
+    
+    self.optiFineVersionButton = [UIButton buttonWithType:UIButtonTypeSystem];
+    self.optiFineVersionButton.translatesAutoresizingMaskIntoConstraints = NO;
+    [self.optiFineVersionButton setTitle:@"选择版本" forState:UIControlStateNormal];
+    self.optiFineVersionButton.titleLabel.font = [UIFont systemFontOfSize:14 weight:UIFontWeightRegular];
+    self.optiFineVersionButton.tintColor = [UIColor systemBlueColor];
+    [self.optiFineVersionButton addTarget:self action:@selector(showOptiFineVersionPicker) forControlEvents:UIControlEventTouchUpInside];
+    [self.optiFineRow addSubview:self.optiFineVersionButton];
+    
+    [NSLayoutConstraint activateConstraints:@[
+        [self.optiFineLabel.leadingAnchor constraintEqualToAnchor:self.optiFineRow.leadingAnchor constant:16],
+        [self.optiFineLabel.centerYAnchor constraintEqualToAnchor:self.optiFineRow.centerYAnchor],
+        [self.optiFineSwitch.trailingAnchor constraintEqualToAnchor:self.optiFineRow.trailingAnchor constant:-16],
+        [self.optiFineSwitch.centerYAnchor constraintEqualToAnchor:self.optiFineRow.centerYAnchor],
+        [self.optiFineVersionButton.trailingAnchor constraintEqualToAnchor:self.optiFineSwitch.leadingAnchor constant:-8],
+        [self.optiFineVersionButton.centerYAnchor constraintEqualToAnchor:self.optiFineRow.centerYAnchor],
+        [self.optiFineRow.topAnchor constraintEqualToAnchor:self.fabricAPIRow.bottomAnchor],
+        [self.optiFineRow.leadingAnchor constraintEqualToAnchor:self.optionsContainer.leadingAnchor],
+        [self.optiFineRow.trailingAnchor constraintEqualToAnchor:self.optionsContainer.trailingAnchor],
+        [self.optiFineRow.bottomAnchor constraintEqualToAnchor:self.optionsContainer.bottomAnchor],
+        [self.optiFineRow.heightAnchor constraintEqualToConstant:44]
+    ]];
+    
+    // Initially hide option rows
+    self.fabricAPIRow.hidden = YES;
+    self.optiFineRow.hidden = YES;
 }
 
 - (void)setupInstallButton {
@@ -468,18 +531,6 @@
         [self.optionsContainer.trailingAnchor constraintEqualToAnchor:self.view.trailingAnchor constant:-16],
         [self.optionsContainer.bottomAnchor constraintEqualToAnchor:self.installButton.topAnchor constant:-12],
         
-        [self.fabricAPILabel.leadingAnchor constraintEqualToAnchor:self.optionsContainer.leadingAnchor constant:16],
-        [self.fabricAPILabel.centerYAnchor constraintEqualToAnchor:self.optionsContainer.centerYAnchor],
-        
-        [self.fabricAPISwitch.trailingAnchor constraintEqualToAnchor:self.optionsContainer.trailingAnchor constant:-16],
-        [self.fabricAPISwitch.centerYAnchor constraintEqualToAnchor:self.optionsContainer.centerYAnchor],
-        
-        [self.optiFineLabel.leadingAnchor constraintEqualToAnchor:self.optionsContainer.leadingAnchor constant:16],
-        [self.optiFineLabel.centerYAnchor constraintEqualToAnchor:self.optionsContainer.centerYAnchor],
-        
-        [self.optiFineSwitch.trailingAnchor constraintEqualToAnchor:self.optionsContainer.trailingAnchor constant:-16],
-        [self.optiFineSwitch.centerYAnchor constraintEqualToAnchor:self.optionsContainer.centerYAnchor],
-        
         [self.installButton.leadingAnchor constraintEqualToAnchor:self.view.leadingAnchor constant:16],
         [self.installButton.trailingAnchor constraintEqualToAnchor:self.view.trailingAnchor constant:-16],
         [self.installButton.bottomAnchor constraintEqualToAnchor:self.view.safeAreaLayoutGuide.bottomAnchor constant:-20],
@@ -495,12 +546,163 @@
     [self dismissViewControllerAnimated:YES completion:nil];
 }
 
+- (void)fabricAPISwitchChanged:(UISwitch *)sender {
+    self.fabricAPIVersionButton.enabled = sender.isOn;
+    self.fabricAPIVersionButton.alpha = sender.isOn ? 1.0 : 0.5;
+}
+
+- (void)optiFineSwitchChanged:(UISwitch *)sender {
+    self.optiFineVersionButton.enabled = sender.isOn;
+    self.optiFineVersionButton.alpha = sender.isOn ? 1.0 : 0.5;
+    if (sender.isOn && !self.selectedOptiFineVersion) {
+        [self fetchOptiFineVersions];
+    }
+}
+
+- (void)showFabricAPIVersionPicker {
+    if (!self.fabricAPIVersions) {
+        [self fetchFabricAPIVersions];
+        return;
+    }
+    
+    UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"选择 Fabric API 版本"
+                                                                   message:nil
+                                                            preferredStyle:UIAlertControllerStyleActionSheet];
+    
+    [alert addAction:[UIAlertAction actionWithTitle:@"最新版本"
+                                              style:UIAlertActionStyleDefault
+                                            handler:^(UIAlertAction * _Nonnull action) {
+        self.selectedFabricAPIVersion = nil;
+        [self.fabricAPIVersionButton setTitle:@"最新版本" forState:UIControlStateNormal];
+    }]];
+    
+    for (NSString *version in self.fabricAPIVersions) {
+        [alert addAction:[UIAlertAction actionWithTitle:version
+                                                  style:UIAlertActionStyleDefault
+                                                handler:^(UIAlertAction * _Nonnull action) {
+            self.selectedFabricAPIVersion = version;
+            [self.fabricAPIVersionButton setTitle:version forState:UIControlStateNormal];
+        }]];
+    }
+    
+    [alert addAction:[UIAlertAction actionWithTitle:@"取消"
+                                              style:UIAlertActionStyleCancel
+                                            handler:nil]];
+    
+    if (UIDevice.currentDevice.userInterfaceIdiom == UIUserInterfaceIdiomPad) {
+        alert.popoverPresentationController.sourceView = self.fabricAPIVersionButton;
+        alert.popoverPresentationController.sourceRect = self.fabricAPIVersionButton.bounds;
+    }
+    
+    [self presentViewController:alert animated:YES completion:nil];
+}
+
+- (void)showOptiFineVersionPicker {
+    if (!self.optiFineVersions) {
+        [self fetchOptiFineVersions];
+        return;
+    }
+    
+    UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"选择 OptiFine 版本"
+                                                                   message:nil
+                                                            preferredStyle:UIAlertControllerStyleActionSheet];
+    
+    for (NSString *version in self.optiFineVersions) {
+        [alert addAction:[UIAlertAction actionWithTitle:version
+                                                  style:UIAlertActionStyleDefault
+                                                handler:^(UIAlertAction * _Nonnull action) {
+            self.selectedOptiFineVersion = version;
+            [self.optiFineVersionButton setTitle:version forState:UIControlStateNormal];
+        }]];
+    }
+    
+    [alert addAction:[UIAlertAction actionWithTitle:@"取消"
+                                              style:UIAlertActionStyleCancel
+                                            handler:nil]];
+    
+    if (UIDevice.currentDevice.userInterfaceIdiom == UIUserInterfaceIdiomPad) {
+        alert.popoverPresentationController.sourceView = self.optiFineVersionButton;
+        alert.popoverPresentationController.sourceRect = self.optiFineVersionButton.bounds;
+    }
+    
+    [self presentViewController:alert animated:YES completion:nil];
+}
+
+- (void)fetchFabricAPIVersions {
+    NSString *apiUrl = [NSString stringWithFormat:@"https://api.modrinth.com/v2/project/fabric-api/version?game_versions=[\"%@\"]&loaders=[\"fabric\"]", self.gameVersion];
+    
+    NSURLSessionDataTask *task = [[NSURLSession sharedSession] dataTaskWithURL:[NSURL URLWithString:apiUrl] completionHandler:^(NSData *data, NSURLResponse *response, NSError *error) {
+        if (data && !error) {
+            NSError *jsonError;
+            NSArray *versions = [NSJSONSerialization JSONObjectWithData:data options:0 error:&jsonError];
+            if (versions && !jsonError) {
+                NSMutableArray *versionNumbers = [NSMutableArray array];
+                for (NSDictionary *version in versions) {
+                    NSString *versionNumber = version[@"version_number"];
+                    if (versionNumber) {
+                        [versionNumbers addObject:versionNumber];
+                    }
+                }
+                dispatch_async(dispatch_get_main_queue(), ^{
+                    self.fabricAPIVersions = versionNumbers;
+                    [self showFabricAPIVersionPicker];
+                });
+            }
+        } else {
+            dispatch_async(dispatch_get_main_queue(), ^{
+                [self.fabricAPIVersionButton setTitle:@"获取失败" forState:UIControlStateNormal];
+            });
+        }
+    }];
+    [task resume];
+}
+
+- (void)fetchOptiFineVersions {
+    // OptiFine versions from BMCLAPI mirror
+    NSString *apiUrl = @"https://bmclapi2.bangbang93.com/optifine/versionList";
+    
+    NSURLSessionDataTask *task = [[NSURLSession sharedSession] dataTaskWithURL:[NSURL URLWithString:apiUrl] completionHandler:^(NSData *data, NSURLResponse *response, NSError *error) {
+        if (data && !error) {
+            NSError *jsonError;
+            NSArray *versions = [NSJSONSerialization JSONObjectWithData:data options:0 error:&jsonError];
+            if (versions && !jsonError) {
+                NSMutableArray *filteredVersions = [NSMutableArray array];
+                for (NSDictionary *version in versions) {
+                    NSString *mcVersion = version[@"mcversion"];
+                    if ([mcVersion isEqualToString:self.gameVersion]) {
+                        NSString *typeName = version[@"typename"];
+                        NSString *versionName = [NSString stringWithFormat:@"%@ (%@)", version[@"version"], typeName ?: @""];
+                        [filteredVersions addObject:versionName];
+                    }
+                }
+                dispatch_async(dispatch_get_main_queue(), ^{
+                    self.optiFineVersions = filteredVersions;
+                    if (filteredVersions.count > 0) {
+                        [self showOptiFineVersionPicker];
+                    } else {
+                        UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"无可用版本"
+                                                                                       message:[NSString stringWithFormat:@"没有找到适用于 Minecraft %@ 的 OptiFine 版本", self.gameVersion]
+                                                                                preferredStyle:UIAlertControllerStyleAlert];
+                        [alert addAction:[UIAlertAction actionWithTitle:@"确定" style:UIAlertActionStyleDefault handler:nil]];
+                        [self presentViewController:alert animated:YES completion:nil];
+                    }
+                });
+            }
+        } else {
+            dispatch_async(dispatch_get_main_queue(), ^{
+                [self.optiFineVersionButton setTitle:@"获取失败" forState:UIControlStateNormal];
+            });
+        }
+    }];
+    [task resume];
+}
+
 - (void)installButtonTapped {
     BOOL installFabricAPI = [self.selectedLoader isEqualToString:@"fabric"] ? self.fabricAPISwitch.isOn : NO;
     BOOL installOptiFine = [self.selectedLoader isEqualToString:@"forge"] ? self.optiFineSwitch.isOn : NO;
     
     if (self.completion) {
-        self.completion(self.selectedLoader ?: @"vanilla", installFabricAPI, installOptiFine);
+        self.completion(self.selectedLoader ?: @"vanilla", installFabricAPI, installOptiFine, self.selectedFabricAPIVersion, self.selectedOptiFineVersion);
     }
     [self dismissViewControllerAnimated:YES completion:nil];
 }
@@ -582,6 +784,8 @@
     if ([self.selectedLoader isEqualToString:loaderId]) {
         self.selectedLoader = nil;
         self.optionsContainer.hidden = YES;
+        self.fabricAPIRow.hidden = YES;
+        self.optiFineRow.hidden = YES;
     } else {
         self.selectedLoader = loaderId;
         self.optionsContainer.hidden = NO;
@@ -592,20 +796,14 @@
         }];
         
         if ([loaderId isEqualToString:@"fabric"]) {
-            self.fabricAPILabel.hidden = NO;
-            self.fabricAPISwitch.hidden = NO;
-            self.optiFineLabel.hidden = YES;
-            self.optiFineSwitch.hidden = YES;
+            self.fabricAPIRow.hidden = NO;
+            self.optiFineRow.hidden = YES;
         } else if ([loaderId isEqualToString:@"forge"]) {
-            self.fabricAPILabel.hidden = YES;
-            self.fabricAPISwitch.hidden = YES;
-            self.optiFineLabel.hidden = NO;
-            self.optiFineSwitch.hidden = NO;
+            self.fabricAPIRow.hidden = YES;
+            self.optiFineRow.hidden = NO;
         } else {
-            self.fabricAPILabel.hidden = YES;
-            self.fabricAPISwitch.hidden = YES;
-            self.optiFineLabel.hidden = YES;
-            self.optiFineSwitch.hidden = YES;
+            self.fabricAPIRow.hidden = YES;
+            self.optiFineRow.hidden = YES;
         }
     }
     
@@ -1279,10 +1477,10 @@
     loaderVC.gameVersion = version[@"id"];
     
     __weak typeof(self) weakSelf = self;
-    loaderVC.completion = ^(NSString *loaderType, BOOL installFabricAPI, BOOL installOptiFine) {
+    loaderVC.completion = ^(NSString *loaderType, BOOL installFabricAPI, BOOL installOptiFine, NSString *fabricAPIVersion, NSString *optiFineVersion) {
         __strong typeof(weakSelf) strongSelf = weakSelf;
         if (!strongSelf) return;
-        [strongSelf proceedWithVersion:version loaderType:loaderType installFabricAPI:installFabricAPI installOptiFine:installOptiFine];
+        [strongSelf proceedWithVersion:version loaderType:loaderType installFabricAPI:installFabricAPI installOptiFine:installOptiFine fabricAPIVersion:fabricAPIVersion optiFineVersion:optiFineVersion];
     };
     
     UINavigationController *nav = [[UINavigationController alloc] initWithRootViewController:loaderVC];
@@ -1293,15 +1491,15 @@
     [self presentViewController:nav animated:YES completion:nil];
 }
 
-- (void)proceedWithVersion:(NSDictionary *)version loaderType:(NSString *)loaderType installFabricAPI:(BOOL)installFabricAPI installOptiFine:(BOOL)installOptiFine {
+- (void)proceedWithVersion:(NSDictionary *)version loaderType:(NSString *)loaderType installFabricAPI:(BOOL)installFabricAPI installOptiFine:(BOOL)installOptiFine fabricAPIVersion:(NSString *)fabricAPIVersion optiFineVersion:(NSString *)optiFineVersion {
     NSString *versionId = version[@"id"];
     
     if ([loaderType isEqualToString:@"vanilla"]) {
         [self downloadVersion:version withLoader:nil];
     } else if ([loaderType isEqualToString:@"fabric"]) {
-        [self openFabricInstaller:versionId installAPI:installFabricAPI];
+        [self openFabricInstaller:versionId installAPI:installFabricAPI apiVersion:fabricAPIVersion];
     } else if ([loaderType isEqualToString:@"forge"]) {
-        [self openForgeInstaller:versionId installOptiFine:installOptiFine];
+        [self openForgeInstaller:versionId installOptiFine:installOptiFine optiFineVersion:optiFineVersion];
     } else if ([loaderType isEqualToString:@"neoforge"]) {
         [self openNeoForgeInstaller:versionId];
     } else if ([loaderType isEqualToString:@"quilt"]) {
@@ -1311,10 +1509,11 @@
     }
 }
 
-- (void)openFabricInstaller:(NSString *)versionId installAPI:(BOOL)installAPI {
+- (void)openFabricInstaller:(NSString *)versionId installAPI:(BOOL)installAPI apiVersion:(NSString *)apiVersion {
     FabricInstallViewController *fabricVC = [[FabricInstallViewController alloc] init];
     fabricVC.gameVersion = versionId;
     fabricVC.shouldInstallAPI = installAPI;
+    fabricVC.fabricAPIVersion = apiVersion;
     
     __weak typeof(self) weakSelf = self;
     void (^completion)(BOOL, NSString *, NSError *) = ^(BOOL success, NSString *profileName, NSError *error) {
@@ -1334,9 +1533,11 @@
     [self presentViewController:nav animated:YES completion:nil];
 }
 
-- (void)openForgeInstaller:(NSString *)versionId installOptiFine:(BOOL)installOptiFine {
+- (void)openForgeInstaller:(NSString *)versionId installOptiFine:(BOOL)installOptiFine optiFineVersion:(NSString *)optiFineVersion {
     ForgeInstallViewController *forgeVC = [[ForgeInstallViewController alloc] init];
     forgeVC.gameVersion = versionId;
+    forgeVC.installOptiFine = installOptiFine;
+    forgeVC.optiFineVersion = optiFineVersion;
     
     __weak typeof(self) weakSelf = self;
     void (^completion)(BOOL, NSString *, NSError *) = ^(BOOL success, NSString *profileName, NSError *error) {

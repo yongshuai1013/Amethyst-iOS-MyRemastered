@@ -22,6 +22,8 @@
 // Installation state
 @property(nonatomic, assign) BOOL isInstalling;
 @property(nonatomic, copy) NSString *installedProfileName;
+@property(nonatomic, strong) UIActivityIndicatorView *loadingIndicator;
+@property(nonatomic, strong) UIBarButtonItem *installButton;
 @end
 
 @implementation FabricInstallViewController
@@ -29,7 +31,7 @@
 - (void)viewDidLoad {
     // Setup navigation bar
     self.title = localize(@"profile.title.install_fabric_quilt", nil);
-    self.navigationItem.leftBarButtonItem = [[UIBarButtonItem alloc] initWithBarButtonSystemItem:UIBarButtonSystemItemDone target:self action:@selector(actionDone:)];
+    self.navigationItem.leftBarButtonItem = [[UIBarButtonItem alloc] initWithBarButtonSystemItem:UIBarButtonSystemItemDone target:self action:@selector(actionInstall)];
     self.navigationItem.rightBarButtonItem = [[UIBarButtonItem alloc] initWithBarButtonSystemItem:UIBarButtonSystemItemClose target:self action:@selector(actionClose)];
 
     // Setup appearance
@@ -96,7 +98,6 @@
               @"title": @"preference.profile.title.loader_type",
               @"type": typePickSegment,
               @"pickList": @[localize(@"Release", nil), @"Unstable"],
-              //localize(@"Unstable", nil)
               @"action": ^(int type) {
                   [weakSelf changeLoaderTypeTo:type];
               }
@@ -120,14 +121,20 @@
 }
 
 - (void)fetchVersionEndpoints:(int)type {
+    // Show loading indicator
+    [self showLoadingIndicator];
+    
     // Fetch version
     __block BOOL errorShown = NO;
     id errorCallback = ^(NSURLSessionTask *operation, NSError *error) {
         if (!errorShown) {
             errorShown = YES;
             NSDebugLog(@"Error: %@", error);
-            showDialog(localize(@"Error", nil), error.localizedDescription);
-            [self actionClose];
+            dispatch_async(dispatch_get_main_queue(), ^{
+                [self hideLoadingIndicator];
+                showDialog(localize(@"Error", nil), error.localizedDescription);
+                [self actionClose];
+            });
         }
     };
     AFHTTPSessionManager *manager = [AFHTTPSessionManager manager];
@@ -136,12 +143,35 @@
         NSDebugLog(@"[%@ Installer] Got %d game versions", self.localKVO[@"loaderVendor"], response.count);
         self.versionMetadata = response;
         [self changeVersionTypeTo:[self.localKVO[@"gameType_index"] intValue]];
+        [self checkAndHideLoadingIndicator];
     } failure:errorCallback];
     [manager GET:endpoint[@"loader"] parameters:nil headers:nil progress:nil success:^(NSURLSessionTask *task, NSArray *response) {
         NSDebugLog(@"[%@ Installer] Got %d loader versions", self.localKVO[@"loaderVendor"], response.count);
         self.loaderMetadata = response;
         [self changeLoaderTypeTo:[self.localKVO[@"loaderType_index"] intValue]];
+        [self checkAndHideLoadingIndicator];
     } failure:errorCallback];
+}
+
+- (void)showLoadingIndicator {
+    if (!self.loadingIndicator) {
+        self.loadingIndicator = [[UIActivityIndicatorView alloc] initWithActivityIndicatorStyle:UIActivityIndicatorViewStyleMedium];
+    }
+    [self.loadingIndicator startAnimating];
+    self.navigationItem.leftBarButtonItem = [[UIBarButtonItem alloc] initWithCustomView:self.loadingIndicator];
+}
+
+- (void)hideLoadingIndicator {
+    [self.loadingIndicator stopAnimating];
+    self.navigationItem.leftBarButtonItem = [[UIBarButtonItem alloc] initWithTitle:localize(@"Install", nil) style:UIBarButtonItemStyleDone target:self action:@selector(actionInstall)];
+}
+
+- (void)checkAndHideLoadingIndicator {
+    // Only hide if both version and loader metadata are loaded
+    if (self.versionMetadata.count > 0 && self.loaderMetadata.count > 0) {
+        [self hideLoadingIndicator];
+        [self.tableView reloadData];
+    }
 }
 
 - (void)actionClose {
@@ -152,10 +182,10 @@
     [self.navigationController dismissViewControllerAnimated:YES completion:nil];
 }
 
-- (void)actionDone:(UIBarButtonItem *)sender {
+- (void)actionInstall {
     if (self.isInstalling) return;
     self.isInstalling = YES;
-    sender.enabled = NO;
+    self.navigationItem.leftBarButtonItem.enabled = NO;
 
     NSDictionary *endpoint = self.endpoints[self.localKVO[@"loaderVendor"]];
     NSString *path = [NSString stringWithFormat:endpoint[@"json"], self.localKVO[@"gameVersion"], self.localKVO[@"loaderVersion"]];
@@ -168,7 +198,7 @@
         if (!strongSelf) return;
         
         strongSelf.isInstalling = NO;
-        sender.enabled = YES;
+        strongSelf.navigationItem.leftBarButtonItem.enabled = YES;
 
         NSString *jsonPath = [NSString stringWithFormat:@"%1$s/versions/%2$@/%2$@.json", getenv("POJAV_GAME_DIR"), response[@"id"]];
         [NSFileManager.defaultManager createDirectoryAtPath:jsonPath.stringByDeletingLastPathComponent withIntermediateDirectories:YES attributes:nil error:nil];
@@ -201,7 +231,7 @@
         __strong typeof(weakSelf) strongSelf = weakSelf;
         if (strongSelf) {
             strongSelf.isInstalling = NO;
-            sender.enabled = YES;
+            strongSelf.navigationItem.leftBarButtonItem.enabled = YES;
         }
         NSDebugLog(@"Error: %@", error);
         showDialog(localize(@"Error", nil), error.localizedDescription);
@@ -237,7 +267,6 @@
 
 - (void)installFabricAPIWithCompletion:(void (^)(BOOL success, NSError *error))completion {
     NSString *gameVersion = self.localKVO[@"gameVersion"];
-    NSString *fabricVersion = self.localKVO[@"loaderVersion"];
     
     // Fabric API download URL from Modrinth
     NSString *apiUrl = [NSString stringWithFormat:@"https://api.modrinth.com/v2/project/fabric-api/version?game_versions=[\"%@\"]&loaders=[\"fabric\"]", gameVersion];
@@ -250,9 +279,22 @@
             return;
         }
         
-        // Get the latest version
-        NSDictionary *latestVersion = response.firstObject;
-        NSArray *files = latestVersion[@"files"];
+        // Find the specified version or use the latest
+        NSDictionary *selectedVersion = nil;
+        if (self.fabricAPIVersion) {
+            for (NSDictionary *version in response) {
+                if ([version[@"version_number"] isEqualToString:self.fabricAPIVersion]) {
+                    selectedVersion = version;
+                    break;
+                }
+            }
+        }
+        
+        if (!selectedVersion) {
+            selectedVersion = response.firstObject;
+        }
+        
+        NSArray *files = selectedVersion[@"files"];
         NSDictionary *primaryFile = nil;
         for (NSDictionary *file in files) {
             if ([file[@"primary"] boolValue]) {

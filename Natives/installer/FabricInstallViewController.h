@@ -5,6 +5,7 @@
 
 @property (nonatomic, copy) NSString *gameVersion;
 @property (nonatomic, assign) BOOL shouldInstallAPI;
+@property (nonatomic, copy) NSString *fabricAPIVersion;
 @property (nonatomic, copy) void (^completionHandler)(BOOL success, NSString *profileName, NSError *error);
 
 @end

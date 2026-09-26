@@ -9,6 +9,15 @@
 #include <sys/stat.h>
 #include <unistd.h>
 #include <mach/mach.h>
+// 独立 native 崩溃捕获（见 ameInstallCrashCapture 处注释）
+#include <execinfo.h>
+#include <fcntl.h>
+#include <mach-o/dyld.h>
+#include <pthread.h>
+#include <signal.h>
+#include <sys/mman.h>
+#include <sys/ucontext.h>
+#include <time.h>
 // Task 99：MC 26.3 的 Window.<init> 经 jna-objc 找 NSApplication（AppKit 菜单集成）
 // iOS 无 AppKit，需要在 JLI_Launch 前用 ObjC 运行时注册最小桩类。
 #include <objc/runtime.h>
@@ -38,6 +47,173 @@ BOOL validateVirtualMemorySpace(size_t size) {
     if(map == MAP_FAILED || munmap(map, size) != 0)
         return NO;
     return YES;
+}
+
+#pragma mark - 独立 native 崩溃捕获
+
+// 为什么需要它：游戏闪退时，写 latestlog.txt 的线程随进程一起消失，日志必然
+// 截断在最后一行，永远拿不到崩溃点。此前十几轮排查全是静态对照，正是因为
+// 缺一份真正的 native 栈。这里在进程内直接用 sigaltstack + sigaction 抓栈，
+// 写到 <POJAV_HOME>/native-crash.log（独立于游戏日志，进程被杀也不丢）。
+//
+// 安全约束：signal handler 内只允许 async-signal-safe 操作 —— write、预先
+// 打开的 fd、栈上缓冲。禁止 NSLog / malloc / ObjC / 锁 / 路径拼接。地址到
+// 十六进制的转换自己写（ameCrashU64），不依赖 snprintf。
+//
+// 崩溃后不 _exit，而是依靠 SA_RESETHAND 让 handler 自动恢复为 SIG_DFL：
+// handler 返回后出错指令重新执行并再次触发，此时交给系统默认处理，iOS
+// 「设置 → 隐私与安全性 → 分析数据」里也能同时留下一份标准报告。
+
+#define AME_CRASH_MAX_FRAMES 64
+
+static int gAmeCrashFd = -1;
+static void *gAmeCrashAltStack = NULL;
+static size_t gAmeCrashAltStackSize = 0;
+static volatile sig_atomic_t gAmeCrashInHandler = 0;
+
+// 把 v 格式化成 16 位定长十六进制（含前导零），写入 out[17]。
+static void ameCrashU64(char *out, uint64_t v) {
+    static const char digits[] = "0123456789abcdef";
+    for (int i = 15; i >= 0; i--) { out[i] = digits[v & 0xfu]; v >>= 4; }
+    out[16] = '\0';
+}
+
+static void ameCrashWrite(const char *s) {
+    if (gAmeCrashFd >= 0 && s != NULL) write(gAmeCrashFd, s, strlen(s));
+}
+
+// 手写拼接 "label=0xXXXXXXXXXXXXXXXX\n"，全程只用栈上缓冲 + write。
+static void ameCrashLine(const char *label, uint64_t v) {
+    if (gAmeCrashFd < 0) return;
+    char hex[17];
+    char buf[128];
+    size_t n = 0;
+    ameCrashU64(hex, v);
+    for (const char *p = label; *p != '\0' && n < sizeof(buf) - 20; p++) buf[n++] = *p;
+    buf[n++] = '='; buf[n++] = '0'; buf[n++] = 'x';
+    for (int i = 0; i < 16; i++) buf[n++] = hex[i];
+    buf[n++] = '\n';
+    write(gAmeCrashFd, buf, n);
+}
+
+static void ameCrashHandler(int sig, siginfo_t *si, void *ucRaw) {
+    // 递归保护：handler 自身再出错时直接退出，避免无限循环。
+    if (gAmeCrashInHandler) _exit(128 + sig);
+    gAmeCrashInHandler = 1;
+
+    uint64_t pc = 0, sp = 0, fp = 0, lr = 0;
+    ucontext_t *uc = (ucontext_t *)ucRaw;
+#if defined(__arm64__) || defined(__aarch64__)
+    if (uc != NULL && uc->uc_mcontext != NULL) {
+        pc = (uint64_t)uc->uc_mcontext->__ss.__pc;
+        sp = (uint64_t)uc->uc_mcontext->__ss.__sp;
+        fp = (uint64_t)uc->uc_mcontext->__ss.__fp;
+        lr = (uint64_t)uc->uc_mcontext->__ss.__lr;
+    }
+#endif
+
+    ameCrashWrite("\n=== NATIVE CRASH ===\n");
+    ameCrashLine("signal", (uint64_t)(int64_t)sig);
+    ameCrashLine("si_addr", (uint64_t)(uintptr_t)(si != NULL ? si->si_addr : NULL));
+    ameCrashLine("si_code", (uint64_t)(int64_t)(si != NULL ? si->si_code : 0));
+    ameCrashLine("thread", (uint64_t)pthread_mach_thread_np(pthread_self()));
+    ameCrashLine("pc", pc);
+    ameCrashLine("sp", sp);
+    ameCrashLine("fp", fp);
+    ameCrashLine("lr", lr);
+
+    // backtrace 在 arm64 上依赖 frame pointer，可能不完整；原始地址始终写出，
+    // 之后用 dSYM + atos，或按下方 image slide 手工定位。
+    void *frames[AME_CRASH_MAX_FRAMES];
+    int nf = backtrace(frames, AME_CRASH_MAX_FRAMES);
+    ameCrashLine("frames", (uint64_t)(int64_t)nf);
+    for (int i = 0; i < nf && i < AME_CRASH_MAX_FRAMES; i++) {
+        ameCrashLine("  frame", (uint64_t)(uintptr_t)frames[i]);
+    }
+    // best-effort 符号化：非 async-signal-safe，放最后，即使它出问题，前面的
+    // 原始地址也已经落盘。
+    if (gAmeCrashFd >= 0 && nf > 0) backtrace_symbols_fd(frames, nf, gAmeCrashFd);
+    ameCrashWrite("=== END CRASH ===\n");
+}
+
+// 启动时记录已加载镜像清单 + slide：崩溃日志里只有原始地址，没有 slide 就
+// 无法判断 PC 落在哪个 dylib、偏移多少。
+static void ameCrashDumpImages(void) {
+    if (gAmeCrashFd < 0) return;
+    uint32_t count = _dyld_image_count();
+    for (uint32_t i = 0; i < count; i++) {
+        const char *name = _dyld_get_image_name(i);
+        intptr_t slide = _dyld_get_image_vmaddr_slide(i);
+        dprintf(gAmeCrashFd, "image[%u] slide=0x%016llx %s\n",
+                i, (uint64_t)slide, name != NULL ? name : "(null)");
+    }
+}
+
+static void ameCrashDumpEnv(const char *key) {
+    if (gAmeCrashFd < 0) return;
+    const char *v = getenv(key);
+    dprintf(gAmeCrashFd, "env %s=%s\n", key, v != NULL ? v : "(unset)");
+}
+
+// 在 JLI_Launch 之前调用；幂等，重复调用无副作用。
+static void ameInstallCrashCapture(void) {
+    static BOOL installed = NO;
+    if (installed) return;
+    installed = YES;
+
+    const char *off = getenv("AMETHYST_CRASH_CAPTURE");
+    if (off != NULL && off[0] == '0') {
+        NSLog(@"[JavaLauncher] native crash capture disabled (AMETHYST_CRASH_CAPTURE=0)");
+        return;
+    }
+
+    const char *home = getenv("POJAV_HOME");
+    if (home == NULL || home[0] == '\0') home = "/tmp";
+    char path[PATH_MAX];
+    snprintf(path, sizeof(path), "%s/native-crash.log", home);
+    gAmeCrashFd = open(path, O_WRONLY | O_CREAT | O_APPEND, 0644);
+    if (gAmeCrashFd < 0) {
+        NSLog(@"[JavaLauncher] native crash capture unavailable (cannot open %s)", path);
+        return;
+    }
+
+    dprintf(gAmeCrashFd, "\n\n======== LAUNCH %lld ========\n", (long long)time(NULL));
+    ameCrashDumpEnv("AMETHYST_RENDERER");
+    ameCrashDumpEnv("AMETHYST_RENDERER_RTLD_GLOBAL");
+    ameCrashDumpEnv("AMETHYST_PRELOAD_ISOLATE");
+    ameCrashDumpEnv("AMETHYST_SFPEW_BACKEND");
+    ameCrashDumpEnv("SFPEW_EGL");
+    ameCrashDumpEnv("MG_DIR_PATH");
+    ameCrashDumpEnv("POJAV_GAME_DIR");
+    ameCrashDumpImages();
+
+    // 备用信号栈：栈溢出类崩溃时原栈已不可用，handler 必须跑在独立栈上。
+    gAmeCrashAltStackSize = 128 * 1024;
+    gAmeCrashAltStack = mmap(NULL, gAmeCrashAltStackSize, PROT_READ | PROT_WRITE,
+                             MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (gAmeCrashAltStack != MAP_FAILED) {
+        stack_t ss;
+        ss.ss_sp = gAmeCrashAltStack;
+        ss.ss_size = gAmeCrashAltStackSize;
+        ss.ss_flags = 0;
+        sigaltstack(&ss, NULL);
+    } else {
+        gAmeCrashAltStack = NULL;
+    }
+
+    const int sigs[] = { SIGSEGV, SIGBUS, SIGABRT, SIGILL, SIGFPE };
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_sigaction = ameCrashHandler;
+    // SA_RESETHAND：进入 handler 即自动恢复 SIG_DFL，handler 返回后再次触发时
+    // 由系统默认处理，既有我们的日志也有标准 crash report。
+    sa.sa_flags = SA_SIGINFO | SA_ONSTACK | SA_RESETHAND;
+    sigemptyset(&sa.sa_mask);
+    for (size_t i = 0; i < sizeof(sigs) / sizeof(sigs[0]); i++) {
+        sigaction(sigs[i], &sa, NULL);
+    }
+
+    NSLog(@"[JavaLauncher] native crash capture armed -> %s", path);
 }
 
 void init_loadDefaultEnv() {
@@ -173,6 +349,22 @@ void init_loadMobileGluesConfig() {
         [renderer isEqualToString:@"auto"] ||
         [renderer isEqualToString:@ RENDERER_NAME_VULKAN];
 
+    // SFPEW 独立选中（渲染器列表里的 SFPEW 项）时，真后端由 AMETHYST_SFPEW_BACKEND
+    // 决定，缺省 libmobileglues.dylib。此时 MobileGlues 依然会被加载 —— 只是改由
+    // SFPEW 内部 dlopen 成为它的后端 —— 所以 config.json 必须照常写入。
+    //
+    // 漏掉这一步的后果（1.7.10 + SFPEW standalone 真机日志实测）：
+    //     MG_DIR_PATH = /sdcard/MG          ← Android 默认路径，iOS 上不存在
+    //     config.json not loaded, using defaults
+    // 于是 enableExtDirectStateAccess 落回默认 true、maxGlslCacheSize 落回 30、
+    // customGLVersion 变成 (default)，本仓库写入的 MG 偏好在 SFPEW 路径下全部失效，
+    // Task166 的 DSA 默认改关等修复也就完全够不到这一条路径。
+    if (!usesMobileGlues && isSFPEWRenderer(renderer.UTF8String)) {
+        const char *backend = getenv("AMETHYST_SFPEW_BACKEND");
+        if (backend == NULL || backend[0] == '\0') backend = RENDERER_NAME_MOBILEGLUES;
+        usesMobileGlues = (strcmp(backend, RENDERER_NAME_MOBILEGLUES) == 0);
+    }
+
     if (!usesMobileGlues) {
         NSLog(@"[JavaLauncher] MobileGlues config not written (renderer is not mobileglues/auto/vulkan)");
         return;
@@ -200,7 +392,31 @@ void init_loadMobileGluesConfig() {
     // customGLVersion 约束（settings.cpp 第 71-79 行）：>46 截断为 46，<32 且非 0 截断为 32，
     // 33-39 截断为 33，0 使用默认值 40。
     // 因此必须写入十进制数（40, 41, 42, ..., 46），不能写入十六进制 0x040000。
-    config[@"enableExtDirectStateAccess"] = @1;
+    // Task 166（对齐 Air）：DSA 默认改为【关】。
+    // Air 三会话 A/B 实锤（同机同模组包同 MobileGlues 2.0.17）：
+    //   enable_ext_direct_state_access=0 → "DSA support not detected" → 全程可玩 + FSR 生效
+    //   =1 → "ARB_direct_state_access detected, enabling DSA" → 黑屏
+    //        （swap 100% 健康 + render-texture 探针全零 + 首秒固定 10 次一次性
+    //         "No context is current"）
+    // 机理：MobileGlues 2.0.17 的 DSA 是 DSAWrapper 模拟层（temporarilyBindFramebuffer
+    // 的状态往返在 FSR1 fb0 重定向下自洽性未经上游验证），MC 26.x 的 DSA 路径一旦
+    // 激活即不再走经典路径。这正是「26.2 可玩、26.3 闪退」的成因。
+    //
+    // 此前本仓库默认为 @1（开启）—— 与 Air 相反，且我曾据此错误地判定
+    // 「Task166 反向迁移对本仓库不适用」。实为 26.3 + MobileGlues 崩溃的直接原因。
+    //
+    // Task 167：存量设备迁移。若偏好里已存 1（旧默认或用户手动开过），
+    // 仅改默认值无效（下方覆盖链会读回 1），故在此显式迁回 0。
+    // 用户日后仍可在设置里手动开回。
+    {
+        id dsaPref = getPrefObject(@"mobileglues.enable_ext_direct_state_access");
+        if (dsaPref && [dsaPref respondsToSelector:@selector(boolValue)] && [dsaPref boolValue]) {
+            setPrefObject(@"mobileglues.enable_ext_direct_state_access", @NO);
+            NSLog(@"[JavaLauncher] Task167: migrated legacy mobileglues.enable_ext_direct_state_access 1 -> 0 "
+                  @"(Air Task166/167: DSA on breaks MC 26.x under MobileGlues)");
+        }
+    }
+    config[@"enableExtDirectStateAccess"] = @0;
     config[@"maxGlslCacheSize"] = @128;
     config[@"customGLVersion"] = @40;  // 十进制 40 = GL 4.0
 
@@ -223,18 +439,32 @@ void init_loadMobileGluesConfig() {
     // 不读该键，写了也是无效键；而且它与 GL 3.2 档自相
     // 矛盾（宣称 GL 4.3 能力）。Air 从不写这个键。
     //
-    // 开关语义：用户开启 mobileglues.enable_angle 即选 GLES 档（GL 3.2），
-    // 关闭即选 OpenGL 4.0 档（GL 4.0）——与 Air 的两档一一对应，
-    // 可直接切换回退。
+    // Task158 对齐 Air 的语义修正（Air latestlog 26.3-rc-2 + libmobileglues.dylib 实证）：
+    //   Air 的两档由 *渲染器档位*（ame158_mg_mobileglues_mode）决定，而不是由
+    //   mobileglues.enable_angle 这个开关决定：
+    //     mode 1（mg GLES 后端）  → enableANGLE=3 + customGLVersion=32
+    //     mode 2（mg OpenGL 4.0） → enableANGLE=0 + customGLVersion=40
+    //     mode 0（独立 MobileGlues 直选）→ 不强制，保持默认 customGLVersion=40
+    //   Air 那份 26.3-rc-2 全程可玩日志（swapOK=3402 无崩溃）正是 mode 0：
+    //     mobileglues.enable_angle = 0 -> enableANGLE = 0
+    //     mobileglues.custom_gl_version = 0 (raw) -> customGLVersion = 40
+    //     [Render thread] Using graphics backend OpenGL, using drivers: 4.0.0 MobileGlues 2.0.17
+    //
+    // 本函数只在 renderer 为 libmobileglues / auto / vulkan 时执行，即 Air 的 mode 0
+    // 场景，因此必须保持默认 40（GL 4.0）。
+    //
+    // 此前把 enable_angle 开关直接绑成 GLES 档（angleOn → 32）是错误的映射：
+    // 存量设备上 enable_angle=YES 会把 26.3 的驱动版本压到 GL 3.2，
+    // 而 26.3 在 GL 4.0 下才走通（26.2 不受影响，故表现为"26.2 可玩、26.3 闪退"）。
+    // 现在 enable_angle 只写 enableANGLE 键（iOS 上 MG 不读该键，仅作记录），
+    // 不再降级 customGLVersion。需要 GL 3.2 的用户请在设置里显式选择
+    // mobileglues.custom_gl_version = 3.2（下方透传逻辑照常生效，与 Air 一致）。
     id enableAngle = getPrefObject(@"mobileglues.enable_angle");
     BOOL angleOn = [enableAngle respondsToSelector:@selector(boolValue)] && [enableAngle boolValue];
     config[@"enableANGLE"] = angleOn ? @3 : @0;
-    if (angleOn) {
-        config[@"customGLVersion"] = @32;
-    }
-    NSLog(@"[JavaLauncher] Task158: mg backend -> MobileGlues (enableANGLE=%@, customGLVersion=%@; "
-          @"ANGLE is inert on iOS -- MG settings.cpp Apple branch hardcodes Disabled and never reads the key; "
-          @"customGLVersion is the only live knob)",
+    NSLog(@"[JavaLauncher] Task158: mg backend -> MobileGlues mode 0 (直选) -- enableANGLE=%@, "
+          @"customGLVersion=%@ (Air 对齐：mode 0 不强制，保持 GL 4.0 默认；"
+          @"enableANGLE 在 iOS 上被 MG settings.cpp Apple 分支硬编码忽略)",
           config[@"enableANGLE"], config[@"customGLVersion"]);
 
     id enableNoError = getPrefObject(@"mobileglues.enable_no_error");
@@ -269,8 +499,35 @@ void init_loadMobileGluesConfig() {
 
     id multidrawMode = getPrefObject(@"mobileglues.multidraw_mode");
     if (multidrawMode) {
-        config[@"multidrawMode"] = @([multidrawMode intValue]);
-        NSLog(@"[JavaLauncher]   mobileglues.multidraw_mode = %@ -> multidrawMode = %@", multidrawMode, config[@"multidrawMode"]);
+        // Task 79（对齐参考仓库）：MG 2.0.16 起多重绘制后端选择改为"优先序"
+        // 机制——config 键 multidrawOrder（逗号分隔、best-first，全局序可含
+        // 伪项 native=各入口同形的 GLES core/EXT 函数；每入口可用
+        // multidrawOrder<EntryPoint> 覆盖）。旧的 multidrawMode 整数键已被
+        // 弃用：settings.cpp 只打 legacy 警告、从不读取——此前这里写进去的
+        // 值一直是静默 no-op（用户在 UI 里切"间接/模拟"毫无效果，实际永远
+        // 走 MG 默认序，含 compute 后端）。
+        // 三个既有档位映射为等价的优先序（与 settings.cpp 默认序对齐）：
+        //   0 Auto     = MG 默认序：native/EXT 优先，单调用批量后端优先于
+        //                逐子绘制循环，compute 垫底
+        //   1 Indirect = 间接族优先：multiindirect/indirect 打头（GPU 整批
+        //                提交，转译开销最小），不用 native 伪项
+        //   2 Emulated = CPU 循环优先：unroll/basevertex 打头（最保守，驱动
+        //                缺扩展时的兜底形态）
+        NSString *mdOrder = nil;
+        switch ([multidrawMode intValue]) {
+            case 1:
+                mdOrder = @"multiindirect,indirect,multibasevertex,multiarrays,basevertex,unroll,compute";
+                break;
+            case 2:
+                mdOrder = @"unroll,basevertex,indirect,multiindirect,multibasevertex,multiarrays,compute";
+                break;
+            default:
+                mdOrder = @"native,multiindirect,multibasevertex,multiarrays,indirect,basevertex,unroll,compute";
+                break;
+        }
+        config[@"multidrawOrder"] = mdOrder;
+        NSLog(@"[JavaLauncher]   mobileglues.multidraw_mode = %@ -> multidrawOrder = %@ (旧键 multidrawMode 已被 MG 2.0.16+ 弃用，不再写入)",
+              multidrawMode, mdOrder);
     }
 
     id angleDepthClearFixMode = getPrefObject(@"mobileglues.angle_depth_clear_fix_mode");
@@ -445,6 +702,28 @@ NSInteger ame98_mcMajorFromVersionId(NSString *versionId) {
         return [[versionId substringWithRange:[match rangeAtIndex:1]] integerValue];
     }
     return 0;
+}
+
+// SFPEW（固定管线仿真层）适用的 MC 版本判定：仅 GL 1.x 固定管线时代，即 <= 1.16.x。
+// MC 1.17 起渲染切到 GL 3.2 core + shader/VAO，不再有 immediate mode（glBegin/glEnd、
+// 光照、texenv、矩阵栈等），SFPEW 的 fpe_shadergen 无对象可仿真，叠加只带来
+// 多一层转发开销与崩溃风险（26.3 会话实测因此崩于 glCheckFramebufferStatus 垃圾值）。
+// 年份制版本（21wxx 起，含 26.x）一律属于 1.17+，返回 NO。
+static BOOL ameSFPEWSupportsVersionId(NSString *versionId) {
+    if (![versionId isKindOfClass:[NSString class]] || versionId.length == 0) {
+        return NO;
+    }
+    NSRegularExpression *legacyRegex = [NSRegularExpression
+        regularExpressionWithPattern:@"(?:^|[-_])1\\.(\\d+)" options:0 error:nil];
+    NSTextCheckingResult *match = [legacyRegex firstMatchInString:versionId
+                                                          options:0
+                                                            range:NSMakeRange(0, versionId.length)];
+    if (match && match.numberOfRanges >= 2) {
+        NSInteger minor = [[versionId substringWithRange:[match rangeAtIndex:1]] integerValue];
+        return minor <= 16;
+    }
+    // 年份制（26.3 / 25w45a 等）或非 1.x 版本号
+    return NO;
 }
 
 // 解析 profile 的 lwjglVersion 设置为具体的 LWJGL 版本：
@@ -658,6 +937,12 @@ int launchJVM(NSString *accountId, id launchTarget, int width, int height, int m
     init_loadDefaultEnv();
     init_loadCustomEnv();
 
+    // 武装崩溃捕获：游戏闪退时 latestlog.txt 会随进程一起消失，只有这里写的
+    // native-crash.log 能留下崩溃栈。
+    // 必须放在 init_loadCustomEnv() 之后 —— 否则读不到用户在设置里填的
+    // AMETHYST_CRASH_CAPTURE=0。仍在 JLI_Launch 之前，启动期崩溃一样能抓到。
+    ameInstallCrashCapture();
+
     // 同步自 catsruledogs：刷新 JIT flags，决定是否需要 Debug JIT Mapping
     // 使用 DeviceNeedsDebugJITMapping() 基于 JIT_FLAG_IS_IOS_26 | JIT_FLAG_FORCE_MIRRORED
     // 而非 TXM 固件检测，确保 iOS 26+ 无 TXM 设备也能正确设置 JIT 脚本
@@ -809,6 +1094,73 @@ int launchJVM(NSString *accountId, id launchTarget, int width, int height, int m
             // 切换渲染器后清掉，避免残留影响后续启动
             unsetenv("MOBILEGL_BACKEND_TYPE");
             unsetenv("MOBILEGL_LOG_FILE_PATH");
+        }
+
+        // SimpleFPEWrapper（MobileGL-Dev，LGPL-3.0）—— 固定管线 (GL 1.x) 仿真层。
+        // 与安卓 feat/sfpew_angle 同款接入：安卓把 LWJGL 实际加载的 renderLibrary
+        // 换成 libSimpleFPEWrapper.so 并用 SFPEW_EGL 指向真后端（默认 MobileGlues）；
+        // iOS 侧 AMETHYST_RENDERER 已经是最终被 dlopen 的库名，所以这里只需要把
+        // 后端 EGL 路径写进 SFPEW_EGL —— SFPEW 的 init 会 dlopen 它并通过
+        // eglGetProcAddress 取回全部 GL 入口点。
+        // 后端可用 AMETHYST_SFPEW_BACKEND 覆盖，缺省 libmobileglues.dylib。
+        // 叠加模型（对齐安卓 Tools.useSFPEW）：默认开启，作用于 GLES 后端渲染器。
+        // 安卓是"保留 POJAVEXEC_EGL 指向真后端 + 把 renderLibrary 换成
+        // libSimpleFPEWrapper.so"；iOS 侧 AMETHYST_RENDERER 同时决定 LWJGL 加载的
+        // GL 库和 EGL 路由，所以这里把它换成 SFPEW，并把真后端写进 SFPEW_EGL /
+        // AMETHYST_SFPEW_BACKEND，由 SFPEW 内部 dlopen 后端并转发。
+        id sfpewPref = getPrefObject(@"video.sfpew_overlay");
+        BOOL sfpewEnabled = NO;
+        if (sfpewPref != nil && [sfpewPref respondsToSelector:@selector(boolValue)]) {
+            sfpewEnabled = [sfpewPref boolValue];
+        } else if (sfpewPref == nil) {
+            // 首次运行落默认（默认关闭），保证设置页开关与实际一致
+            setPrefObject(@"video.sfpew_overlay", @NO);
+        }
+        // 版本门控：SFPEW 只服务 GL 1.x 固定管线，仅对 <= 1.16.x 生效。
+        // 26.x / 25wxx 等年份制版本一律跳过，避免无意义叠加导致崩溃。
+        NSString *sfpewVersionId = nil;
+        if ([launchTarget isKindOfClass:NSDictionary.class]) {
+            sfpewVersionId = [launchTarget[@"id"] description];
+        } else if ([launchTarget isKindOfClass:NSString.class]) {
+            sfpewVersionId = (NSString *)launchTarget;
+        }
+        if (sfpewVersionId.length == 0) {
+            sfpewVersionId = [PLProfiles.current.selectedProfile[@"lastVersionId"] description];
+        }
+        BOOL sfpewVersionOK = ameSFPEWSupportsVersionId(sfpewVersionId);
+        if (sfpewEnabled && !sfpewVersionOK) {
+            NSLog(@"[JavaLauncher] SFPEW overlay skipped: MC %@ needs no fixed-function emulation (SFPEW serves <= 1.16.x only)",
+                  sfpewVersionId);
+        }
+        // 独立选中 SFPEW（渲染器列表里的 SFPEW 项，而非叠加）：
+        // AMETHYST_RENDERER 已经是 SFPEW 本身，只需把真后端写进 SFPEW_EGL。
+        // 后端由 AMETHYST_SFPEW_BACKEND 指定，缺省 libmobileglues.dylib。
+        // 与叠加分支最终的环境变量形态完全一致，只是入口不同。
+        if (isSFPEWRenderer(renderer.UTF8String)) {
+            const char *backend = getenv("AMETHYST_SFPEW_BACKEND");
+            if (backend == NULL || backend[0] == '\0') backend = RENDERER_NAME_MOBILEGLUES;
+            setenv("AMETHYST_SFPEW_BACKEND", backend, 1);
+            NSString *bPathS = [NSString stringWithFormat:@"@rpath/%s", backend];
+            setenv("SFPEW_EGL", bPathS.UTF8String, 1);
+            if (!sfpewVersionOK) {
+                NSLog(@"[JavaLauncher] SFPEW standalone: MC %@ is outside the fixed-function era -- "
+                      @"expect no benefit (SFPEW serves <= 1.16.x only)", sfpewVersionId);
+            }
+            NSLog(@"[JavaLauncher] SFPEW standalone: backend=%s -> AMETHYST_RENDERER=%@, SFPEW_EGL=%@",
+                  backend, renderer, bPathS);
+        } else if (sfpewEnabled && sfpewVersionOK && isSFPEWOverlayEligibleRenderer(renderer.UTF8String)) {
+            const char *backend = renderer.UTF8String;
+            setenv("AMETHYST_SFPEW_BACKEND", backend, 1);
+            NSString *bPath = [NSString stringWithFormat:@"@rpath/%s", backend];
+            setenv("SFPEW_EGL", bPath.UTF8String, 1);
+            renderer = @ RENDERER_NAME_SFPEW;
+            setenv("AMETHYST_RENDERER", renderer.UTF8String, 1);
+            NSLog(@"[JavaLauncher] SFPEW overlay active: backend=%s -> AMETHYST_RENDERER=%@, SFPEW_EGL=%@",
+                  backend, renderer, bPath);
+        } else {
+            // 切换渲染器后清掉，避免残留影响后续启动
+            unsetenv("AMETHYST_SFPEW_BACKEND");
+            unsetenv("SFPEW_EGL");
         }
 
         // Mithril 渲染器（libmithril.dylib）自带 EGL + GL 3.3 Core（Vulkan backend），
@@ -1490,9 +1842,18 @@ int launchJVM(NSString *accountId, id launchTarget, int width, int height, int m
             if (forceGlobal == NULL) forceGlobal = getenv("AMETHYST_MOBILEGL_RTLD_GLOBAL");
             // 与 egl_bridge.m 同一套排除规则：需要向其他镜像暴露符号的渲染器
             // 保持 RTLD_GLOBAL（ANGLE 是共享 EGL host；Mesa/gallium 内部互解析）。
+            // SFPEW 必须 RTLD_GLOBAL：它是 opengl.libname（LWJGL 的 GL 提供者），
+            // 而 LWJGL 在 iOS 上用 dlsym(RTLD_DEFAULT, "gl*") 解析 GL 入口。
+            // 若这里以 RTLD_LOCAL 预载，SFPEW 的 gl* 进不了 flat namespace，
+            // LWJGL 会命中 RTLD_GLOBAL 的 ANGLE 副本 —— 而当前上下文是 SFPEW
+            // 后端（MobileGL/MobileGlues）建的，ANGLE 侧无上下文，
+            // glCheckFramebufferStatus 等返回垃圾值（实测 93651672）。
+            // 这与 egl_bridge.m「preloading ... with RTLD_GLOBAL」的意图一致；
+            // 隔离只服务于 26.3/SDL3，SFPEW 面向 ≤1.16.5，无从冲突。
             const BOOL needsGlobalSymbols =
                 strcmp(preloadName, RENDERER_NAME_MTL_ANGLE) == 0 ||
-                strncmp(preloadName, "libOSMesa", 9) == 0;
+                strncmp(preloadName, "libOSMesa", 9) == 0 ||
+                strcmp(preloadName, RENDERER_NAME_SFPEW) == 0;
             const BOOL forceGlobalSymbols = (forceGlobal != NULL && forceGlobal[0] == '1');
             if (preloadIsolateDisabled) {
                 NSLog(@"[JavaLauncher] renderer preload skipped: AMETHYST_PRELOAD_ISOLATE=0 (%s)",
@@ -1641,6 +2002,10 @@ int launchHeadlessJVM(NSString *mainClass, NSArray<NSString *> *args, int minJav
 
     init_loadDefaultEnv();
     init_loadCustomEnv();
+
+    // 安装器阶段同样可能崩（Forge/NeoForge processors），一并捕获。
+    // 位置同 launchJVM：必须在 init_loadCustomEnv() 之后才能读到开关。
+    ameInstallCrashCapture();
 
     // 与 launchJVM 相同的 JIT26 处理（iOS 26+ 无 TXM 设备需要 Debug JIT Mapping）
     DeviceGetJITFlags(YES);

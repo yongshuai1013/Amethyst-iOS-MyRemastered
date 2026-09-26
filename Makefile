@@ -383,20 +383,38 @@ dep_mg:
 	#     SIGSEGV，启动/资源重载阶段直接杀进程（无 .ips、无 hs_err，表现为静默闪退）。
 	#   * glslang-pool-zero-and-size-guards.patch —— GlslangToSpv::convertSwizzle 的
 	#     constArray 尺寸判，必须打在 nullguard 之上。
-	# 幂等：先 --check 正向，失败再 --check 反向（判定已打过），两种情况都继续构建。
-	@mg_3prel=Natives/external/MobileGlues/MobileGlues-cpp/3rdparty; \
+	# Task 170 —— 补丁必须打在 src/main/cpp 这条真实路径上，不能走 MobileGlues-cpp。
+	# MobileGlues-cpp 是 symlink -> src/main/cpp（本仓库 vendored 布局；参考仓库 Air 该处
+	# 是实体目录）。git apply 拒绝穿过符号链接：
+	#   error: affected file '.../MobileGlues-cpp/3rdparty/glslang/...' is beyond a symbolic link
+	# 于是正向 --check 与反向 --check 双双失败，两个 MC 26.x position_color SIGSEGV 防护
+	# 补丁被静默跳过 —— 构建日志里的
+	#   "[dep_mg] WARNING: ... neither applies nor is applied -- MG glslang left UNPATCHED"
+	# 正是它。pin 对齐又把已内置防护的 vendored 树整体换成上游 f5f664d（无防护），
+	# 于是 libmobileglues 长期是在"零防护"状态下编出来的：26.3 资源重载期解析
+	# position_color 顶点着色器时 SIGSEGV，无 hs_err、无 .ips、表现为静默闪退；
+	# 26.2 不走这条链故不受影响。参考仓库 Air 因是实体目录，补丁正常落地，故其
+	# MG + 26.3 全程可玩。
+	# 顺序有依赖：nullguard 必须先于 pool-zero/size-guard（后者基于前者）。
+	# 现在任一环失败即 exit 1 —— 绝不再静默产出无防护的 MG。
+	@mg_3prel=Natives/external/MobileGlues/src/main/cpp/3rdparty; \
 	mg_glrel=$$mg_3prel/glslang; \
 	mg_pdir=$(SOURCEDIR)/$$mg_3prel; \
+	mg_guard_src=$(SOURCEDIR)/$$mg_glrel/glslang/MachineIndependent/ParseHelper.cpp; \
+	if grep -q "Defensive null guards" "$$mg_guard_src" 2>/dev/null; then \
+		echo "[dep_mg] glslang guards already baked into the tree -- skip patches"; \
+	else \
 	for p in glslang-lvalue-nullguard.patch glslang-pool-zero-and-size-guards.patch; do \
-		if [ ! -f "$$mg_pdir/$$p" ]; then echo "[dep_mg] ERROR: glslang patch $$p MISSING under $$mg_3prel -- MG built WITHOUT the MC 26.x position_color SIGSEGV guards"; continue; fi; \
+		if [ ! -f "$$mg_pdir/$$p" ]; then echo "[dep_mg] ERROR: glslang patch $$p MISSING under $$mg_3prel -- MG would be built WITHOUT the MC 26.x position_color SIGSEGV guards"; exit 1; fi; \
 		if git -C $(SOURCEDIR) apply --check -p1 --directory=$$mg_glrel "$$mg_pdir/$$p" >/dev/null 2>&1; then \
-			git -C $(SOURCEDIR) apply -p1 --directory=$$mg_glrel "$$mg_pdir/$$p" && echo "[dep_mg] glslang patch $$p APPLIED" || echo "[dep_mg] WARNING: $$p apply failed"; \
+			git -C $(SOURCEDIR) apply -p1 --directory=$$mg_glrel "$$mg_pdir/$$p" && echo "[dep_mg] glslang patch $$p APPLIED" || { echo "[dep_mg] ERROR: $$p apply failed after a successful --check"; exit 1; }; \
 		elif git -C $(SOURCEDIR) apply --check -R -p1 --directory=$$mg_glrel "$$mg_pdir/$$p" >/dev/null 2>&1; then \
 			echo "[dep_mg] glslang patch $$p already applied"; \
 		else \
-			echo "[dep_mg] WARNING: $$p neither applies nor is applied -- MG glslang left UNPATCHED"; \
+			echo "[dep_mg] ERROR: glslang patch $$p neither applies nor is applied -- MG glslang would be left UNPATCHED (MC 26.x position_color SIGSEGV guards missing)"; exit 1; \
 		fi; \
-	done
+	done; \
+	fi
 	# CMAKE_BUILD_TYPE 必须显式给出：--config 对单配置生成器无效。缺失时 CMake 不追加
 	# -O2/-DNDEBUG，整库 -O0 且 glslang/SPIRV-Cross/MG 的 assert() 全部激活 —— assert
 	# 触发即 __assert_rtn->abort()，表现为直接进启动器错误界面且无 .ips/hs_err。
@@ -449,8 +467,21 @@ dep_mg:
 # 复制出 impl 名字并改写 LC_ID（reexport 记录的是 impl 的 install name，
 # 否则会把构建期绝对路径烧进产物）。
 # ---------------------------------------------------------------------------
-dep_shader_shims: dep_mg
-	echo '[Amethyst v$(VERSION)] dep_shader_shims - start'
+# --- libshaderc_impl.dylib 的来源开关（A/B 用）-------------------------------
+# SHADERC_IMPL_FROM_SOURCE=1 : Air Task 45 路径 —— Natives/shaderc_impl_glue.c
+#                              覆在 dep_mg 刚编出的、已打 nullguard +
+#                              pool-zero/size-guard 补丁的 glslang 静态库上。
+# SHADERC_IMPL_FROM_SOURCE=0 : 垫片引入时的原始行为（3bed818be0）—— 直接用
+#                              Natives/resources/Frameworks/ 下预提交二进制。
+#                              默认 1：两份 hs_err（pid11633 / pid23353）证明两条
+#                              路都崩，且是同一个病 —— 见下方符号围栏注释。围栏
+#                              只能作用于我们自己链接的 impl，预编译二进制改不动，
+#                              故默认走 from-source。变量仍可置 0 做整包 A/B。
+SHADERC_IMPL_FROM_SOURCE ?= 1
+
+ifeq ($(SHADERC_IMPL_FROM_SOURCE),1)
+dep_shaderc_impl: dep_mg
+	echo '[shaderc-impl] mode=from-source (Air Task 45) - start'
 	# libshaderc_impl.dylib 从源码构建：Natives/shaderc_impl_glue.c 直接覆在
 	# glslang C 接口上，链接 dep_mg 刚构建的（已打 nullguard + pool-zero/size-guard
 	# 补丁的）静态库。预编译的 libshaderc.dylib 内含未打补丁的 glslang，其
@@ -474,8 +505,10 @@ dep_shader_shims: dep_mg
 		fi; \
 	done; \
 	echo "[shaderc-impl] linking from-source impl (spirv=$$mg_spirv_a glslang=$$mg_glslang_a rl=$$mg_rl_a extra libs:$$extra_glslang_libs)"; \
+	printf '_shaderc_*\n' > $(WORKINGDIR)/shaderc_impl.exports; \
 	xcrun -sdk iphoneos clang -arch arm64 -dynamiclib \
 		-install_name @rpath/libshaderc_impl.dylib \
+		$(FENCE_IMPL) \
 		-I$(SOURCEDIR)/Natives/external/MobileGlues/MobileGlues-cpp/3rdparty/glslang \
 		-o $(WORKINGDIR)/libshaderc_impl.dylib \
 		$(SOURCEDIR)/Natives/shaderc_impl_glue.c \
@@ -485,17 +518,71 @@ dep_shader_shims: dep_mg
 		$$extra_glslang_libs \
 		-lc++ || exit 1
 	install_name_tool -id @rpath/libshaderc_impl.dylib $(WORKINGDIR)/libshaderc_impl.dylib || exit 1
+	echo '[shaderc-impl] mode=from-source - end'
+else
+dep_shaderc_impl:
+	echo '[shaderc-impl] mode=prebuilt (Natives/resources/Frameworks/libshaderc.dylib) - start'
+	# $(WORKINGDIR) 由 dep_mg 内的 cmake 步骤创建；本分支不再依赖 dep_mg，
+	# 故显式建目录（dep_openal_shim 同款处理），无副作用。
+	mkdir -p $(WORKINGDIR)
+	cp $(SOURCEDIR)/Natives/resources/Frameworks/libshaderc.dylib $(WORKINGDIR)/libshaderc_impl.dylib || exit 1
+	install_name_tool -id @rpath/libshaderc_impl.dylib $(WORKINGDIR)/libshaderc_impl.dylib || exit 1
+	echo '[shaderc-impl] mode=prebuilt - end'
+endif
+
+# --- 导出符号围栏（26.3 + MobileGL/MobileGlues SIGSEGV 根因）----------------
+# 两份真机 hs_err 的崩溃栈都跨了两个镜像：
+#   pid11633  C [libshaderc.dylib+0x3adafc]      spvtools::opt::Module::ForEachInst
+#             C [libMobileGL-gles.dylib+0xfd3014] spvtools::Optimizer::Run
+#   pid23353  C [libMobileGL-gles.dylib+0xaaff64] TGlslangToSpvTraverser::visitAggregate
+#             C [libshaderc_impl.dylib+0x75230]   glslang::TIntermAggregate::traverse
+# 渲染器镜像内嵌一份 glslang / SPIRV-Tools，shaderc 垫片内嵌另一份。两者都是
+# C++ 头文件内联产生的 weak 符号，在 flat namespace 下被 dyld 合并成同一份：
+# MobileGL 用自己那套 AST 建的节点，却跳进 shaderc 镜像里的 traverse/ForEachInst
+# 去遍历 —— 布局与虚表不匹配，随即 SIGSEGV。
+# 这与 impl 是预编译还是 from-source 无关（两份报告各占一条路），只取决于
+# 这些符号有没有被导出进全局空间。
+# shaderc_impl_glue.c 的公开面只有 shaderc_*（其余全 static），spvc_shim.c 只有
+# spvc_*；glslang / spvtools / spirv-cross 的符号纯粹是静态库顺带泄漏出来的。
+# 因此用 -exported_symbols_list 做白名单即可彻底切断串台，不影响垫片功能。
+SHADER_SHIM_SYMBOL_FENCE ?= 1
+
+ifeq ($(SHADER_SHIM_SYMBOL_FENCE),1)
+FENCE_IMPL    := -Wl,-exported_symbols_list,$(WORKINGDIR)/shaderc_impl.exports
+FENCE_SHADERC := -Wl,-exported_symbols_list,$(WORKINGDIR)/shaderc.exports
+FENCE_SPVC    := -Wl,-exported_symbols_list,$(WORKINGDIR)/spvc.exports
+else
+FENCE_IMPL    :=
+FENCE_SHADERC :=
+FENCE_SPVC    :=
+endif
+
+# --- 垫片总开关 -------------------------------------------------------------
+# SHADER_SHIMS=0 : dep_shader_shims 整体停用，Frameworks 下直接随包携带
+#                  Natives/resources/Frameworks/ 里的原始预提交二进制 —— 即
+#                  3bed818be0 引入垫片之前的状态（26.3 + MG 黑屏但不闪退）。
+#                  payload 的 "cp -R Natives/resources/*" 负责把它们放进 app，
+#                  本目标不产出任何同名 dylib，故不会发生覆盖。
+SHADER_SHIMS ?= 1
+
+ifeq ($(SHADER_SHIMS),1)
+dep_shader_shims: dep_shaderc_impl dep_mg
+	echo '[Amethyst v$(VERSION)] dep_shader_shims - start'
 	cp $(SOURCEDIR)/Natives/resources/Frameworks/libspirv-cross-c-shared.0.dylib $(WORKINGDIR)/libspirv-cross-c-shared.0.impl.dylib || exit 1
 	install_name_tool -id @rpath/libspirv-cross-c-shared.0.impl.dylib $(WORKINGDIR)/libspirv-cross-c-shared.0.impl.dylib || exit 1
+	printf '_shaderc_*\n_ame_*\n' > $(WORKINGDIR)/shaderc.exports; \
 	xcrun -sdk iphoneos clang -arch arm64 -dynamiclib \
 		-install_name @rpath/libshaderc.dylib \
+		$(FENCE_SHADERC) \
 		-Wl,-reexport_library,$(WORKINGDIR)/libshaderc_impl.dylib \
 		-o $(WORKINGDIR)/libshaderc.dylib \
 		$(SOURCEDIR)/Natives/shaderc_shim.c \
 		$(SOURCEDIR)/Natives/shaderc_include.c \
 		$(SOURCEDIR)/Natives/shaderc_sandbox.m || exit 1
+	printf '_spvc_*\n_ame_*\n' > $(WORKINGDIR)/spvc.exports; \
 	xcrun -sdk iphoneos clang -arch arm64 -dynamiclib \
 		-install_name @rpath/libspirv-cross-c-shared.0.dylib \
+		$(FENCE_SPVC) \
 		-Wl,-reexport_library,$(WORKINGDIR)/libspirv-cross-c-shared.0.impl.dylib \
 		-o $(WORKINGDIR)/libspirv-cross-c-shared.0.dylib \
 		$(SOURCEDIR)/Natives/spvc_shim.c || exit 1
@@ -540,7 +627,125 @@ dep_shader_shims: dep_mg
 		echo "[dep_shader_shims] MG spvc decoupled: $$mg_dep -> @rpath/libspirv-cross-mg.dylib"; \
 	done
 	echo '[Amethyst v$(VERSION)] dep_shader_shims - end'
+else
+dep_shader_shims:
+	echo '[Amethyst v$(VERSION)] dep_shader_shims - DISABLED (SHADER_SHIMS=0): shipping prebuilt libshaderc.dylib + libspirv-cross-c-shared.0.dylib verbatim (pre-3bed818be0 state)'
+endif
 
+
+
+dep_openal_shim:
+	# Task 129：OpenAL ALC_SOFT_system_events 兼容垫片（26.1.2 整合包崩溃修复）。
+	# - 真库已 git mv 为 libopenal_impl.dylib（openal-soft 1.20.1 iOS 构建，无
+	#   ALC_SOFT_system_events 扩展）；本目标构建同名垫片 libopenal.dylib：
+	#   re-export impl 全部符号 + 覆盖 alcGetString/alcIsExtensionPresent 宣称扩展
+	#   + 提供 alcEventIsSupportedSOFT/alcEventControlSOFT/alcEventCallbackSOFT 桩。
+	# - 根因：MC 26.1.2 CallbackDeviceTracker.isSupported 无扩展守卫，直接调
+	#   LWJGL 绑定 -> ICD 槽位 0 -> NPE 崩溃（26.3 有守卫故存活）。
+	#   桩返回 ALC_FALSE 使 MC 干净回退 PollingDeviceTracker。
+	# - 与 dep_shader_shims 同款模式：re-export 必须指向 impl 名（LC_ID 先修正），
+	#   否则加载递归；本地函数定义优先于 re-export 符号（shaderc 先例）。
+	echo '[Amethyst v$(VERSION)] dep_openal_shim - start'
+	# Task 170：dep_openal_shim 与 dep_mg 同为 payload 前置、并行执行（gmake -j），
+	# 而 $(WORKINGDIR) 由 dep_mg 内的 cmake 步骤创建 —— 本目标先跑到时该目录还不存在，
+	# cp 直接失败（ci: "cp: directory .../Natives/build does not exist"）。
+	# dep_shader_shims 有 dep_mg 依赖故不受影响；这里显式建目录即可，无副作用。
+	mkdir -p $(WORKINGDIR)
+	cp $(SOURCEDIR)/Natives/resources/Frameworks/libopenal_impl.dylib $(WORKINGDIR)/ || exit 1
+	install_name_tool -id @rpath/libopenal_impl.dylib $(WORKINGDIR)/libopenal_impl.dylib || exit 1
+	xcrun -sdk iphoneos clang -arch arm64 -dynamiclib \
+		-install_name @rpath/libopenal.dylib \
+		-Wl,-reexport_library,$(WORKINGDIR)/libopenal_impl.dylib \
+		-o $(WORKINGDIR)/libopenal.dylib \
+		$(SOURCEDIR)/Natives/openal_shim.c || exit 1
+	echo '[Amethyst v$(VERSION)] dep_openal_shim - end'
+
+dep_angle_freeze:
+	echo '[Amethyst v$(VERSION)] dep_angle_freeze - start'
+	# Task 57 (画面分裂根治): 8-byte machine-code patch -- ANGLE Metal
+	# WindowSurfaceMtl::checkIfLayerResized: expected size source switched from
+	# bounds*contentsScale (poisoned by windowed-mode background-thread portrait
+	# geometry, CALayer cross-thread split-brain) to the surface's own latched
+	# mWidth/mHeight ([x19,#0x430/0x438]) -- surface size frozen at creation
+	# geometry (creation reads always clean); transposition becomes physically
+	# impossible; on drawableSize drift the enforcement branch re-writes the
+	# frozen value back onto the layer. Idempotent; loud failure on byte
+	# mismatch (ANGLE version drift guard); full root-cause chain in script
+	# header comments (scripts/patch_angle_surface_freeze.py).
+	# 补丁改写源文件后签名哈希失效 —— 打包时 ldid -S 全 app 递归重签覆盖。
+	python3 $(SOURCEDIR)/scripts/patch_angle_surface_freeze.py \
+		$(SOURCEDIR)/Natives/resources/Frameworks/libGLESv2.framework/libGLESv2 || exit 1
+	echo '[Amethyst v$(VERSION)] dep_angle_freeze - end'
+
+dep_sdl3_guard:
+	echo '[Amethyst v$(VERSION)] dep_sdl3_guard - start'
+	# Task 135 (controlify/JNA closure SIGBUS 源头根治): libSDL3.dylib
+	# 入口机器码守卫 -- SDL_SetEventFilter / SDL_AddEventWatch 的非空回调指针
+	# 一律置空/拒绝注册。controlify 经 JNA 回退加载本 Frameworks 的 iOS 版 SDL3
+	# 后, 把 JNA/libffi closure (RW 不可执行 trampoline 页) 注册进 SDL 事件过滤
+	# 器, SDL 调用即 SIGBUS。dlsym 层守卫对 LWJGL/FFM 解析路径有效, 但 JNA 解析
+	# 路径仍可绕行; 本补丁把守卫下沉到 SDL 二进制自身, 与符号解析链路完全无关。
+	# 启动器自身与 MC/LWJGL 均不使用 SDL 事件过滤器 (全仓 grep 验证), 零误伤;
+	# 签名由打包时 ldid -S 全 app 重签覆盖 (dep_angle_freeze 同款流程)。
+	# 幂等; 字节不匹配 (SDL3 版本漂移) 响亮失败。
+	python3 $(SOURCEDIR)/scripts/patch_sdl3_eventfilter_guard.py \
+		$(SOURCEDIR)/Natives/resources/Frameworks/libSDL3.dylib || exit 1
+	echo '[Amethyst v$(VERSION)] dep_sdl3_guard - end'
+
+# ---------------------------------------------------------------------------
+# dep_sfpew —— SimpleFPEWrapper（MobileGL-Dev，LGPL-3.0）
+#
+# 与安卓 AngelAuraMC/Amethyst-Android @ feat/sfpew_angle 同款接入：SFPEW 位于
+# 渲染器之上，为固定管线（GL 1.x）提供仿真，并把 GL 调用转发给真正的后端。
+# 安卓侧＝Tools.useSFPEW 开关 + SFPEW_EGL 指向后端 EGL + 把 LWJGL 实际加载的库
+# 换成 libSimpleFPEWrapper.so；iOS 侧渲染器列表里多一项 libSimpleFPEWrapper.dylib，
+# JavaLauncher 把 SFPEW_EGL 设为被包裹的真后端（默认 libmobileglues.dylib）。
+#
+# 依赖 dep_mg：glslang / SPIRV-Cross / glm 直接复用 MobileGlues 的 vendored
+# 3rdparty 树，而 dep_mg 会在同一棵树上做 pin 对齐并打两个防护补丁 —— 串行化
+# 保证 SFPEW 编到的是同一份源码。
+# ---------------------------------------------------------------------------
+dep_sfpew: dep_mg
+	echo '[Amethyst v$(VERSION)] dep_sfpew - start'
+	# iOS 适配补丁（AppleClang 15 + deployment target 14.0 下才暴露的两个问题，
+	# Linux/GCC 与 Android NDK 都不触发，故上游源码里没有处理）：
+	#   1. fpe/types.h: glstate_t 的默认构造函数被隐式删除（匿名 union 内含
+	#      带 NSDMI 的匿名 struct），fpe.cpp 的 no_context_state / make_unique 会炸
+	#   2. fpe/fpe_shadergen.cpp: std::format 依赖 std::to_chars(float)，该重载在
+	#      SDK 里标了 introduced=iOS 16.3，deployment target 14.0 下 "unavailable"。
+	#      两层修复缺一不可：
+	#        a) 编译期 —— 补丁第 3 步把全树 std::format 换成自研的
+	#           fpefmt::format（写 fpe/fpe_format_compat.h，纯 ostringstream，
+	#           不引用 <format> / to_chars）。必须整个换掉而不是只改浮点说明符：
+	#           std::format 的模板展开**无条件**拉进 formatter_floating_point.h，
+	#           实测 fpe_shadergen.cpp 的 std::format<unsigned,string,string>
+	#           照样 error。CI 实测 -Wno-unguarded-availability{,-new} 压不住它
+	#           （那两个旗标只管 warn 级，这条是 err 级），仅作顺手保留。
+	#        b) 运行期 —— 补丁把唯一的 {:.1f} 换成 snprintf。保持 deployment
+	#           target 14.0 使 to_chars 引用成为**弱**引用，旧系统解析为 NULL；
+	#           不走到该路径就不会 NULL 解引用。（反过来把 target 抬到 16.3
+	#           会变成强引用，iOS 14~16.2 真机 dyld 找不到符号直接启动崩。）
+	# 与 patch_mobilegl_ios.py 同款约定：幂等 + 锚点校验，锚点不匹配即 exit 1，
+	# 绝不静默打歪补丁编出坏库。必须在 cmake 之前跑（cmake 直接编译树内源码）。
+	python3 $(SOURCEDIR)/Natives/patch_sfpew_ios.py $(SOURCEDIR)/Natives/external/SimpleFPEWrapper || exit 1
+	mkdir -p $(WORKINGDIR)/sfpew
+	cd $(WORKINGDIR)/sfpew && cmake \
+		-DCMAKE_CROSSCOMPILING=true \
+		-DCMAKE_SYSTEM_NAME=Darwin \
+		-DCMAKE_SYSTEM_PROCESSOR=aarch64 \
+		-DCMAKE_OSX_SYSROOT="$(SDKPATH)" \
+		-DCMAKE_OSX_ARCHITECTURES=arm64 \
+		-DCMAKE_OSX_DEPLOYMENT_TARGET=14.0 \
+		-DCMAKE_C_FLAGS="-arch arm64" \
+		-DCMAKE_CXX_FLAGS="-arch arm64" \
+		-DCMAKE_BUILD_TYPE=RelWithDebInfo \
+		-DSFPEW_MG_3RDPARTY="$(SOURCEDIR)/Natives/external/MobileGlues/src/main/cpp/3rdparty" \
+		$(SOURCEDIR)/Natives/external/SimpleFPEWrapper/ > $(WORKINGDIR)/sfpew_build.log 2>&1 \
+		|| { echo '[dep_sfpew] cmake configure FAILED -- tail:'; tail -n 120 $(WORKINGDIR)/sfpew_build.log; exit 1; }
+	cmake --build $(WORKINGDIR)/sfpew --config RelWithDebInfo -j$(JOBS) --target SimpleFPEWrapper >> $(WORKINGDIR)/sfpew_build.log 2>&1 \
+		|| { echo '[dep_sfpew] build FAILED -- tail:'; tail -n 200 $(WORKINGDIR)/sfpew_build.log; exit 1; }
+	cp $(WORKINGDIR)/sfpew/libSimpleFPEWrapper.dylib $(WORKINGDIR)/ || exit 1
+	echo '[Amethyst v$(VERSION)] dep_sfpew - end'
 
 dep_mobilegl:
 	@{ echo '== MobileGL build diagnostics =='; \
@@ -698,12 +903,17 @@ assets:
 	fi
 	echo '[Amethyst v$(VERSION)] assets - end'
 
-payload: native dep_mg dep_shader_shims java jre assets
+payload: native dep_mg dep_shader_shims dep_openal_shim dep_angle_freeze dep_sdl3_guard java jre assets
 	echo '[Amethyst v$(VERSION)] payload - start'
 	# Mithril / MobileGL 都是可选渲染器：这里用 - 前缀，任一失败都不阻断主构建。
 	# 缺库时对应渲染器会在设置里自动隐藏（见 LauncherPreferences.m 的存在性过滤）。
 	-$(MAKE) dep_mithril
 	-$(MAKE) dep_mobilegl
+	# SimpleFPEWrapper：不再用 - 前缀吞失败。之前"可选"开关把编译错误静默成
+	# 绿色，产出的 IPA 里根本没有 libSimpleFPEWrapper.dylib（假绿）。现在 iOS
+	# 适配补丁 + 编译旗标都已就位，构建失败必须响亮红 —— 与 dep_mg 同款约定。
+	# dep_sfpew 内部会把 cmake/编译输出落盘并在失败时 tail 出来，方便定位。
+	$(MAKE) dep_sfpew
 	$(call METHOD_DIRCHECK,$(WORKINGDIR)/AngelAuraAmethyst.app/libs)
 	$(call METHOD_DIRCHECK,$(WORKINGDIR)/AngelAuraAmethyst.app/libs_caciocavallo)
 	$(call METHOD_DIRCHECK,$(WORKINGDIR)/AngelAuraAmethyst.app/libs_caciocavallo17)
@@ -716,7 +926,7 @@ payload: native dep_mg dep_shader_shims java jre assets
 		ln -sf libspirv-cross-c-shared.0.dylib $(WORKINGDIR)/AngelAuraAmethyst.app/Frameworks/libspirv-cross.dylib; \
 	fi
 		cp -R $(SOURCEDIR)/JavaApp/libs/others/* $(WORKINGDIR)/AngelAuraAmethyst.app/libs/ || exit 1
-	cp $(SOURCEDIR)/JavaApp/build/launcher.jar $(SOURCEDIR)/JavaApp/build/patchjna_agent.jar $(SOURCEDIR)/JavaApp/build/patchsvc.jar $(WORKINGDIR)/AngelAuraAmethyst.app/libs/ || exit 1
+	cp $(SOURCEDIR)/JavaApp/build/launcher.jar $(SOURCEDIR)/JavaApp/build/patchjna_agent.jar $(SOURCEDIR)/JavaApp/build/patchsvc.jar $(SOURCEDIR)/JavaApp/build/mojang-stubs.jar $(WORKINGDIR)/AngelAuraAmethyst.app/libs/ || exit 1
 	# LWJGL 以双版本 jar 发布，由启动器按 MC 版本在运行时选择其一。
 	# 必须放进各自的 libs/lwjgl-<ver>/ 子目录：若平铺进 libs/，会被 classpath 中
 	# 的 libs/* 一并加载，使 3.3.3 与 3.4.1 的同名类同时进入 classpath 造成冲突。

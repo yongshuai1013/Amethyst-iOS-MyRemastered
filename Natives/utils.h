@@ -67,6 +67,27 @@
 #define RENDERER_NAME_MOBILEGL "libMobileGL.dylib"
 #define RENDERER_NAME_MOBILEGL_GLES "libMobileGL-gles.dylib"
 
+// SimpleFPEWrapper（MobileGL-Dev，LGPL-3.0）—— 固定管线 (GL 1.x) 仿真层。
+// 接入方式对齐安卓 AngelAuraMC/Amethyst-Android @ feat/sfpew_angle：SFPEW 顶替
+// 渲染器被 LWJGL dlopen，真正的后端 EGL 由环境变量 SFPEW_EGL 指定，SFPEW 内部
+// dlopen 它并转发调用。安卓是 Tools.useSFPEW + SFPEW_EGL + 把 renderLibrary
+// 换成 libSimpleFPEWrapper.so；iOS 侧 AMETHYST_RENDERER 本身就是最终库名，
+// 故只需补 SFPEW_EGL（见 JavaLauncher.m）。
+#define RENDERER_NAME_SFPEW "libSimpleFPEWrapper.dylib"
+
+static inline bool isSFPEWRenderer(const char *renderer) {
+    return renderer && !strcmp(renderer, RENDERER_NAME_SFPEW);
+}
+
+// SFPEW 只能叠加在「OpenGL ES 后端」之上（对齐安卓 JREUtils：gl4es / system-gles /
+// zink 一律 Tools.useSFPEW=false，只有 MobileGlues 这类 GLES 后端才叠加）。
+// 桌面 GL→GLES 的 MobileGL-gles 同样属于 GLES 后端，故一并允许。
+static inline bool isSFPEWOverlayEligibleRenderer(const char *renderer) {
+    if (!renderer) return false;
+    return !strcmp(renderer, RENDERER_NAME_MOBILEGLUES) ||
+           !strcmp(renderer, RENDERER_NAME_MOBILEGL_GLES);
+}
+
 static inline bool isMobileGLRenderer(const char *renderer) {
     return renderer && (!strcmp(renderer, RENDERER_NAME_MOBILEGL) ||
                         !strcmp(renderer, RENDERER_NAME_MOBILEGL_GLES));
@@ -189,6 +210,10 @@ BOOL CallbackBridge_nativeSendChar(jchar codepoint /* jint codepoint */);
 BOOL CallbackBridge_nativeSendCharMods(jchar codepoint, int mods);
 void CallbackBridge_nativeSendCursorPos(char event, CGFloat x, CGFloat y);
 void CallbackBridge_nativeSendKey(int key, int scancode, int action, int mods);
+// Task83：控件按钮键盘打字——按下时按 US ANSI 布局补发一个字符事件
+// （MC 1.13+ 聊天框只认 charTyped/text-input，纯 key 事件不进文本）。
+// 仅由按钮路径调用（SurfaceViewController executebtn），硬件键盘不走这里。
+BOOL CallbackBridge_buttonKeySynthesizeText(int key);
 void CallbackBridge_nativeSendMouseButton(int button, int action, int mods);
 void CallbackBridge_nativeSendScreenSize(int width, int height);
 void CallbackBridge_nativeSendScroll(CGFloat xoffset, CGFloat yoffset);

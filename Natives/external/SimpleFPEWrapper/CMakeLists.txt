@@ -58,7 +58,23 @@ endforeach()
 #   **强**引用，iOS 14~16.2 真机 dyld 找不到符号 → 启动即崩（libc++ 是系统
 #   dylib）。保持 14.0 且彻底不引用该符号，两头都安全。
 # ---------------------------------------------------------------------------
-set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fvisibility=default -funwind-tables -g -D_THREAD_SAFE -fPIC -stdlib=libc++ -Wno-unguarded-availability -Wno-unguarded-availability-new")
+# [fix/sfpew-symbol-fence] -fvisibility=default -> hidden。
+# 之前 default 让镜像内静态链入的 glslang / SPIRV-Cross / spvtools 的 C++ 符号
+# （含模板弱符号与 RTTI typeinfo）全量进入动态符号表；本 dylib 又被启动器以
+# RTLD_GLOBAL 预载（needsGlobalSymbols 白名单），于是：
+#   SFPEW+MobileGL-gles: 两份不同版本的 glslang 弱符号被 dyld 合并 ->
+#     TIntermAggregate::traverse(libSimpleFPEWrapper) 直接调进
+#     TGlslangToSpvTraverser::visitAggregate(libMobileGL-gles) ->
+#     AST 节点布局对不上 -> SEGV_ACCERR
+#     (hs_err pid46490, native-crash L21973, 242b409 实测复现)
+# 这与 shaderc 垫片 1a7fc202 的 -exported_symbols_list 围栏同一问题家族。
+# 修法：默认 hidden，只靠 SFPEW_APIENTRY（extern "C" + visibility("default")）
+# 显式导出。init.h 的 220 个 gl* 声明、lookup.cpp 的 7 个 EGL 入口、
+# glXGetProcAddress/OSMesaGetProcAddress 全部带该宏（已逐一核对），
+# 对外契约不变；镜像内部符号从此不再跨镜像合并。
+# 注意：glslang/spirv-cross 静态库经 add_subdirectory 继承本全局 flags，
+# 隐藏后镜像内链接不受影响（visibility 只影响动态符号表）。
+set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fvisibility=hidden -funwind-tables -g -D_THREAD_SAFE -fPIC -stdlib=libc++ -Wno-unguarded-availability -Wno-unguarded-availability-new")
 set(CMAKE_C_FLAGS   "${CMAKE_C_FLAGS}   -g -std=gnu99 -funwind-tables -O3 -fvisibility=hidden")
 
 # ---------------------------------------------------------------------------

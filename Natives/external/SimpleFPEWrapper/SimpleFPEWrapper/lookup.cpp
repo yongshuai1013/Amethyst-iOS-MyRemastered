@@ -1063,6 +1063,32 @@ SFPEW_APIENTRY void* glXGetProcAddressARB(const char* name) {
     return glXGetProcAddress(name);
 }
 
+// OSMesa-style loader entry. LWJGL 3.3.3 / 3.4.1's macOS GL function provider
+// (GL.create()'s SharedLibrary.Delegate, decompiled "GL$1" in the launcher's
+// Task 172 notes) resolves GL entry points as:
+//
+//     GetProcAddress = dlsym(lib, "glXGetProcAddress")   [LINUX only]
+//                   -> dlsym(lib, "OSMesaGetProcAddress") [macOS reaches only this]
+//     address = GetProcAddress(name) ?: dlsym(lib, name)
+//
+// The wrapper exports only the functions it actually implements; core GL
+// spellings it merely forwards (glGenFramebuffers, glCheckFramebufferStatus,
+// ...) are absent from this dylib's symbol table. On Android the launcher
+// resolves GL through eglGetProcAddress (served below by the wrapper list +
+// backend fallback), so nothing is missing; on macOS/iOS LWJGL dlsym's the
+// opengl.libname library directly, and every unexported core function binds
+// to LWJGL's functionMissingAbort stub - which prints "No context is current
+// ..." and returns register garbage. MC 1.7.10 reads that garbage from
+// glCheckFramebufferStatus and dies with "unknown status".
+//
+// Exporting OSMesaGetProcAddress closes the gap on the macOS chain: LWJGL's
+// primary resolver now goes through eglGetProcAddress, i.e. exactly the
+// Android path. (glXGetProcAddress above serves the same purpose for
+// X11-style loaders.)
+SFPEW_APIENTRY void* OSMesaGetProcAddress(const char* name) {
+    return (void*)eglGetProcAddress(name);
+}
+
 // Context creation is where the wrapper decides whether this individual
 // context needs legacy emulation. The caller's list is never modified unless a
 // native Compatibility Profile probe proved unavailable.

@@ -9,6 +9,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 #include <mach/mach.h>
+#include <mach/task_info.h>
 // 独立 native 崩溃捕获（见 ameInstallCrashCapture 处注释）
 #include <execinfo.h>
 #include <fcntl.h>
@@ -66,7 +67,15 @@ BOOL validateVirtualMemorySpace(size_t size) {
 
 #define AME_CRASH_MAX_FRAMES 64
 
+// 前向声明：handler 需要在定义之前引用内存采样与镜像 dump。
+static void ameCrashSampleMemLocked(const char *tag);
+static void ameCrashDumpImagesFrom(uint32_t start);
+
 static int gAmeCrashFd = -1;
+// 已 dump 过的镜像数量（后台采样线程增量追加用）。必须定义在 handler 之前：
+// handler 内会引用它，而 C 不允许引用后面才声明的变量 —— 这正是上一笔
+// CI 编译失败的原因（use of undeclared identifier）。
+static uint32_t gAmeCrashImageCount = 0;
 static void *gAmeCrashAltStack = NULL;
 static size_t gAmeCrashAltStackSize = 0;
 static volatile sig_atomic_t gAmeCrashInHandler = 0;
@@ -133,20 +142,78 @@ static void ameCrashHandler(int sig, siginfo_t *si, void *ucRaw) {
     // best-effort 符号化：非 async-signal-safe，放最后，即使它出问题，前面的
     // 原始地址也已经落盘。
     if (gAmeCrashFd >= 0 && nf > 0) backtrace_symbols_fd(frames, nf, gAmeCrashFd);
+    // 崩溃时刻补记内存水位 + 上次采样之后新加载的镜像。两者都不是
+    // async-signal-safe，所以放在最后：即使它们出问题，前面的原始地址已落盘。
+    ameCrashSampleMemLocked("crash");
+    ameCrashDumpImagesFrom(gAmeCrashImageCount);
     ameCrashWrite("=== END CRASH ===\n");
 }
 
-// 启动时记录已加载镜像清单 + slide：崩溃日志里只有原始地址，没有 slide 就
+// 记录已加载镜像清单 + slide：崩溃日志里只有原始地址，没有 slide 就
 // 无法判断 PC 落在哪个 dylib、偏移多少。
-static void ameCrashDumpImages(void) {
+//
+// 2026-09-26 修正：原先只在「装配时」dump 一次，那是 JVM 启动之前，
+// libmobileglues / libshaderc_impl 等全部还没 dlopen，清单里根本没有它们，
+// PC 拿到也无法定位。改为：后台采样线程持续增量追加新镜像，崩溃时再补一次。
+static void ameCrashDumpImagesFrom(uint32_t start) {
     if (gAmeCrashFd < 0) return;
     uint32_t count = _dyld_image_count();
-    for (uint32_t i = 0; i < count; i++) {
+    for (uint32_t i = start; i < count; i++) {
         const char *name = _dyld_get_image_name(i);
         intptr_t slide = _dyld_get_image_vmaddr_slide(i);
         dprintf(gAmeCrashFd, "image[%u] slide=0x%016llx %s\n",
                 i, (uint64_t)slide, name != NULL ? name : "(null)");
     }
+    gAmeCrashImageCount = count;
+}
+
+static void ameCrashDumpImages(void) { ameCrashDumpImagesFrom(0); }
+
+// 写一行内存水位。phys_footprint 是 jetsam 实际据以 kill 的指标，比 RSS 更准。
+// 只在普通线程里调用（dprintf 非 async-signal-safe）。
+static void ameCrashSampleMemLocked(const char *tag) {
+    if (gAmeCrashFd < 0) return;
+    uint64_t footprint = 0, resident = 0;
+#if defined(TASK_VM_INFO)
+    task_vm_info_data_t vminfo;
+    mach_msg_type_number_t vmcnt = TASK_VM_INFO_COUNT;
+    if (task_info(mach_task_self(), TASK_VM_INFO, (task_info_t)&vminfo, &vmcnt) == KERN_SUCCESS) {
+        footprint = vminfo.phys_footprint;
+    }
+#endif
+    mach_task_basic_info_data_t basic;
+    mach_msg_type_number_t bcnt = MACH_TASK_BASIC_INFO_COUNT;
+    if (task_info(mach_task_self(), MACH_TASK_BASIC_INFO, (task_info_t)&basic, &bcnt) == KERN_SUCCESS) {
+        resident = basic.resident_size;
+    }
+    dprintf(gAmeCrashFd, "mem %s t=%lld footprint=%llu MB resident=%llu MB\n",
+            tag, (long long)time(NULL),
+            (unsigned long long)(footprint / (1024 * 1024)),
+            (unsigned long long)(resident / (1024 * 1024)));
+}
+
+// 后台采样线程：每 2 秒把内存水位和「新增的镜像」直接写盘。
+//
+// 为什么必须持续写而不是等崩溃时再写：如果进程是被 jetsam 用 SIGKILL 杀掉的
+// （内存超限），signal handler 根本不会执行 —— SIGKILL 不可捕获、不可忽略。
+// 那份 26.3 日志就是这种情况：日志装配成功却没有任何崩溃记录。只有把内存
+// 曲线持续落盘，被 SIGKILL 之后才留下最后一段水位可供判断。
+static void *ameCrashSamplerMain(void *arg) {
+    (void)arg;
+    unsigned interval = 2;
+    const char *iv = getenv("AMETHYST_CRASH_SAMPLE_INTERVAL");
+    if (iv != NULL && iv[0] != '\0') {
+        int parsed = atoi(iv);
+        if (parsed >= 1 && parsed <= 60) interval = (unsigned)parsed;
+    }
+    for (;;) {
+        if (gAmeCrashFd >= 0) {
+            ameCrashSampleMemLocked("sample");
+            ameCrashDumpImagesFrom(gAmeCrashImageCount);
+        }
+        sleep(interval);
+    }
+    return NULL;
 }
 
 static void ameCrashDumpEnv(const char *key) {
@@ -211,6 +278,13 @@ static void ameInstallCrashCapture(void) {
     sigemptyset(&sa.sa_mask);
     for (size_t i = 0; i < sizeof(sigs) / sizeof(sigs[0]); i++) {
         sigaction(sigs[i], &sa, NULL);
+    }
+
+    // 启动后台采样线程：持续把内存水位与新加载镜像写盘。SIGKILL（jetsam 内存
+    // 超限）不可捕获，只有持续落盘才能在那种死法下留下证据。
+    pthread_t sampler;
+    if (pthread_create(&sampler, NULL, ameCrashSamplerMain, NULL) == 0) {
+        pthread_detach(sampler);
     }
 
     NSLog(@"[JavaLauncher] native crash capture armed -> %s", path);
@@ -1037,6 +1111,17 @@ int launchJVM(NSString *accountId, id launchTarget, int width, int height, int m
 
         // Setup AMETHYST_RENDERER
         NSString *renderer = [PLProfiles resolveKeyForCurrentProfile:@"renderer"];
+        // Metal 渲染器（libmetallum.dylib）：图形后端由 metallum agent 走原生 Metal
+        // （直接 MTLDevice），不经过 EGL 渲染器。渲染器回落 auto（→ANGLE）仅为
+        // Surface 提供 GL 上下文，与 metallum 官方集成一致（渲染器只管 GL/Vulkan
+        // 回退）。★ 必须置 AMETHYST_METAL=1：agent 只认这个开关来打开渲染 patch
+        // （MetallumAgent.IS_METAL_RENDERER），否则整段渲染 patch 关闭 ——
+        // 日志 "non-Metal renderer: ... render patches disabled"，26.2 起不来。
+        if ([renderer isEqualToString:@ RENDERER_NAME_METAL]) {
+            setenv("AMETHYST_METAL", "1", 1);
+            NSLog(@"[JavaLauncher] Metal renderer selected: AMETHYST_METAL=1 (EGL renderer falls back to auto for surface)");
+            renderer = @"auto";
+        }
         NSLog(@"[JavaLauncher] RENDERER is set to %@\n", renderer);
         setenv("AMETHYST_RENDERER", renderer.UTF8String, 1);
 
@@ -1243,13 +1328,8 @@ int launchJVM(NSString *accountId, id launchTarget, int width, int height, int m
     setenv("JAVA_HOME", javaHome.UTF8String, 1);
     NSLog(@"[JavaLauncher] JAVA_HOME has been set to %@", javaHome);
 
-    int allocmem;
-    if (getPrefBool(@"java.auto_ram")) {
-        CGFloat autoRatio = getEntitlementValue(@"com.apple.private.memorystatus") ? 0.4 : 0.25;
-        allocmem = roundf((NSProcessInfo.processInfo.physicalMemory >> 20) * autoRatio);
-    } else {
-        allocmem = getPrefInt(@"java.allocated_memory");
-    }
+    // Task141：启动内存单一事实源（见 ame141_currentLaunchAllocMem）。
+    int allocmem = ame141_currentLaunchAllocMem();
     NSLog(@"[JavaLauncher] Max RAM allocation is set to %d MB", allocmem);
     if (!validateVirtualMemorySpace(allocmem)) {
         UIKit_returnToSplitView();
@@ -1552,6 +1632,44 @@ int launchJVM(NSString *accountId, id launchTarget, int width, int height, int m
   
     NSString *librariesPath = [NSString stringWithFormat:@"%@/libs", NSBundle.mainBundle.bundlePath];
     PUSH_MARGV_FORMAT(@"-javaagent:%@/patchjna_agent.jar=", librariesPath);
+    // [Metallum agent] 原生 Metal 后端（26.2 / 26.3）：
+    //   * jar 由 JavaApp/libs/others/ 随包落在 app/libs/（见根 Makefile 的 payload 目标），
+    //     agent 自带 metallum 类集与 natives/ios（libmetallum.dylib、libspvc.dylib），
+    //     运行期自行解出到沙盒，不需要 Frameworks 另行放置。
+    //   * 注入范围由 agent 自己判定（premain 按 MC 版本 / 加载器分流：26.2 走
+    //     classes262 类集、Fabric 缺桩时跳过相应步骤、Forge 走 dummy provider
+    //     且不注入自带 slf4j）。
+    //   * jar 不在 libs/ 时安静跳过，便于回滚与 A/B。
+    //   * [fix/java8-agent] 只对 MC major >= 26 挂载：agent 的 class 文件版本是
+    //     65.0（Java 21+ 编译），而老版本 MC 走 Java 8（class 上限 52.0）——
+    //     此前"老版本 MC 没有目标类，转换器天然 no-op"的假设漏掉了 agent
+    //     本身在 Java 8 上就加载不了这件事（UnsupportedClassVersionError ->
+    //     "processing of -javaagent failed" -> JVM 直接 abort，premain 阶段
+    //     全灭，GL/SFPEW 代码根本没机会跑）。1.7.10 + SFPEW 两路会话的
+    //     latestlog（43177bd 实测）即死于此。
+    //     26.x 强制 Java 25（ResolveLwjglVersion 同款 major 判定），class 65 可加载。
+    if ([[NSFileManager defaultManager] fileExistsAtPath:
+            [librariesPath stringByAppendingPathComponent:@"metallum_agent.jar"]]) {
+        NSString *metallumMcVersionId = nil;
+        if ([launchTarget isKindOfClass:NSDictionary.class]) {
+            metallumMcVersionId = [launchTarget[@"id"] description];
+        } else if ([launchTarget isKindOfClass:NSString.class]) {
+            metallumMcVersionId = (NSString *)launchTarget;
+        }
+        NSInteger metallumMcMajor = ame98_mcMajorFromVersionId(metallumMcVersionId);
+        if (metallumMcMajor >= 26) {
+            PUSH_MARGV_FORMAT(@"-javaagent:%@/metallum_agent.jar=", librariesPath);
+            // 把实例的 MC 版本 id 传给 agent（按版本选 metallum 类映射）
+            if (metallumMcVersionId.length > 0) {
+                PUSH_MARGV_FORMAT(@"-Dmetallum.mc.version=%@", metallumMcVersionId);
+            }
+            NSLog(@"[JavaLauncher] Metallum agent enabled: -javaagent:metallum_agent.jar (mcVersion=%@)",
+                  metallumMcVersionId);
+        } else {
+            NSLog(@"[JavaLauncher] Metallum agent skipped: MC major %ld < 26 (agent needs Java 21+ class files, this session runs Java 8)",
+                  (long)metallumMcMajor);
+        }
+    }
     if(getPrefBool(@"general.cosmetica")) {
         PUSH_MARGV_FORMAT(@"-javaagent:%@/arc_dns_injector.jar=23.95.137.176", librariesPath);
     }
@@ -1674,6 +1792,16 @@ int launchJVM(NSString *accountId, id launchTarget, int width, int height, int m
 
         // Required by Cosmetica to inject DNS
         PUSH_MARGV_LITERAL("--add-opens=java.base/java.net=ALL-UNNAMED");
+
+        // ★ [FIX262] java.base/java.lang 必须对未命名模块 open：
+        //   metallum agent 用 defineClass 把 metallum 类集直接定义进 MC 的类加载器，
+        //   走的是 ClassLoader#defineClass 反射 + setAccessible(true)。未命名模块下
+        //   setAccessible 需要显式 opens，否则抛 InaccessibleObjectException:
+        //     module java.base does not "opens java.lang" to unnamed module
+        //   ⇒ defineMetallumClasses 整段失败，metallum 一个类都定义不上 ⇒ 26.2 起不来。
+        //   （Forge 下 agent 是命名模块，另由 agent 侧 Instrumentation.redefineModule
+        //     打开；这一条对两条路径都安全、无副作用。）
+        PUSH_MARGV_LITERAL("--add-opens=java.base/java.lang=ALL-UNNAMED");
 
         // Setup Caciocavallo
         PUSH_MARGV_LITERAL("-Dawt.toolkit=com.github.caciocavallosilano.cacio.ctc.CTCToolkit");

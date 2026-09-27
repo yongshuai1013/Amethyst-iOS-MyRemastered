@@ -4,6 +4,7 @@
 #import "PLPreferences.h"
 #import "UIKit+hook.h"
 #import <CoreFoundation/CoreFoundation.h>
+#import <os/proc.h>
 
 static PLPreferences* pref;
 
@@ -25,6 +26,92 @@ void toggleIsolatedPref(BOOL forceEnable) {
     // 用户必须重启启动器才能让 instancePath 重新计算。这里改为每次都刷新。
     pref.instancePath = [NSString stringWithFormat:@"%s/launcher_preferences.plist", getenv("POJAV_GAME_DIR")];
     [pref toggleIsolationForced:forceEnable];
+}
+
+#pragma mark - Task141 launch memory
+
+/// Task173（对齐参考仓库 Air）：设备安全堆顶。
+/// os_proc_available_memory() 返回当前进程可安全申请的内存（iOS 13+），
+/// 减去 1200 MB 原生预留（JVM 非堆 + 渲染面 + 系统开销）即为可安全承诺的 -Xmx。
+/// 返回 0 表示不支持（老系统/模拟器），退回物理内存 × 0.6。
+///
+/// [fix/1024-floor] 1024 MB 下限【只适用于 fallback 路径】。
+/// 权威读数路径（os_proc_available_memory 可用）不再做 1024 下限——
+/// iPhone X（3GB，extended VA）实测：available=1807MB -> 安全堆顶 607MB，
+/// 旧代码把 607 强抬到 1024，等于把钳制整个架空：preference 的 706MB
+/// "未超 1024" -> 不钳 -> Xmx706 + JVM 非堆 + MG shadow 纹理/native ->
+/// footprint 爬到 1539MB 后被 jetsam SIGKILL（native-crash.log 无崩溃记录、
+/// latestlog 凭空断在 unifont 字体加载 = SIGKILL 特征，43177bd 两次复现）。
+/// Air 原版同有此下限，但 Air 用户设备 ≥4GB（ceiling 本来就 > 1024），
+/// 下限无副作用；在 3GB 设备上它把"必死的 SIGKILL"换成"可控的 GC 抖动"。
+/// 权威路径宁可要小堆：堆小只是慢，超顶是死。
+static int ame173_safeHeapCeilingMB(void) {
+    static int cachedCeilingMB = -1;
+    if (cachedCeilingMB > 0) return cachedCeilingMB;
+    int ceilingMB = 0;
+    uint64_t avail = os_proc_available_memory();
+    if (avail > 0) {
+        int availMB = (int)(avail >> 20);
+        ceilingMB = availMB - 1200;
+        NSLog(@"[Task173] safe heap ceiling: os_proc_available_memory=%dMB -> Xmx ceiling %dMB (native reserve 1200MB, no floor on authoritative path)", availMB, ceilingMB);
+    }
+    if (ceilingMB <= 0) {
+        int physMB = (int)(NSProcessInfo.processInfo.physicalMemory >> 20);
+        ceilingMB = (int)(physMB * 0.6);
+        if (ceilingMB < 1024) ceilingMB = 1024;   // 仅 fallback：读数不可信时保底
+        NSLog(@"[Task173] safe heap ceiling: fallback 60%% of physical = %dMB (phys=%dMB)", ceilingMB, physMB);
+    }
+    cachedCeilingMB = ceilingMB;
+    return ceilingMB;
+}
+
+int ame141_currentLaunchAllocMem(void) {
+    int deviceMB = (int)(NSProcessInfo.processInfo.physicalMemory >> 20);
+    int allocmem;
+    if (getPrefBool(@"java.auto_ram")) {
+        CGFloat autoRatio = getEntitlementValue(@"com.apple.private.memorystatus") ? 0.5 : 0.25;
+        allocmem = (int)roundf(deviceMB * autoRatio);
+        NSLog(@"[Task141] launch memory from auto ratio %.2f x %dMB = %d MB", autoRatio, deviceMB, allocmem);
+    } else {
+        allocmem = (int)getPrefInt(@"java.allocated_memory");
+        NSLog(@"[Task141] launch memory from preference java.allocated_memory = %d MB", allocmem);
+    }
+    // 调试/A-B 覆盖：AMETHYST_MEM_MB=<n> 直接指定 -Xmx，无需改设置页。
+    const char *forcedMB = getenv("AMETHYST_MEM_MB");
+    if (forcedMB && forcedMB[0]) {
+        int forced = atoi(forcedMB);
+        if (forced > 0) {
+            NSLog(@"[Task141] launch memory overridden by AMETHYST_MEM_MB: %d MB -> %d MB", allocmem, forced);
+            allocmem = forced;
+        }
+    }
+    if (allocmem < 256) allocmem = 256;
+
+    // 只在超过设备安全堆顶时向下钳制（Air Task173）。
+    // 绝不能把健康值压小：上一版 "物理内存 × 0.70 − 1024" 会把 iPhone X 上
+    // 任何 > 953 MB 的设置硬压到 953 MB，反而制造内存不足。
+    //
+    // [fix/memorystatus-gate] 带 com.apple.private.memorystatus entitlement 的
+    // 构建【不钳】：SurfaceViewController 的 updateJetsamControl 会用
+    // memorystatus_control 把 jetsam 任务限额提到 allocmem + 1024（Air 同款，
+    // 越狱设备实证可设：Air 日志 "Successfully set Jetsam task limit
+    // (allocmem=1129 MB, limit=2153 MB)"）。此时钳制反而有害——用户按 Air
+    // 习惯手动调大实例内存（如 1129MB）会被压回 ceiling，制造
+    // limit 偏低的低顶。无 entitlement（限额提不上去，只能吃系统默认）时
+    // 保持钳制作为安全网。
+    const char *noClamp = getenv("AMETHYST_MEM_NO_CLAMP");
+    bool canRaiseJetsamLimit = getEntitlementValue(@"com.apple.private.memorystatus");
+    if (!(noClamp && noClamp[0] == '1') && !canRaiseJetsamLimit) {
+        int ceiling = ame173_safeHeapCeilingMB();
+        if (allocmem > ceiling) {
+            NSLog(@"[Task173] launch memory %dMB exceeds safe ceiling %dMB -- clamping (preference on disk preserved)", allocmem, ceiling);
+            allocmem = ceiling;
+        }
+    } else if (canRaiseJetsamLimit) {
+        NSLog(@"[Task173] memorystatus entitlement present -- jetsam limit will be raised to %d MB (allocmem %d + 1024 native); heap clamp bypassed", allocmem + 1024, allocmem);
+    }
+    NSLog(@"[Task141] final launch memory = %d MB (device %d MB, jetsam limit %d MB)", allocmem, deviceMB, allocmem + 1024);
+    return allocmem;
 }
 
 #pragma mark Download source migration
@@ -266,7 +353,15 @@ static NSArray<NSDictionary *> *rendererCandidates(void) {
         // 两者最终的环境变量形态一致，只是入口不同。
         @{@"key": @ RENDERER_NAME_SFPEW,
           @"name": localize(@"preference.title.renderer.debug.sfpew", nil),
-          @"file": @ RENDERER_NAME_SFPEW}
+          @"file": @ RENDERER_NAME_SFPEW},
+        // Metal（metallum / MetalUniversal）：原生 Metal 后端，对应 dylib 为
+        // libmetallum.dylib（由 metallum agent jar 在运行期解出到 App.app/Frameworks，
+        // 见 utils.h RENDERER_NAME_METAL 与 JavaLauncher.m 置 AMETHYST_METAL=1 的分支）。
+        // 刻意追加在表末：已有 profile / 全局偏好里存的 renderer 值（libxxx.dylib）
+        // 在 pick 控件里按下标配对，插到中间会让这些已存值显示错位。
+        @{@"key": @ RENDERER_NAME_METAL,
+          @"name": localize(@"preference.title.renderer.debug.metal", nil),
+          @"file": @ RENDERER_NAME_METAL}
     ];
 }
 

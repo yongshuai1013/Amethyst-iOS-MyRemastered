@@ -2014,28 +2014,56 @@ static void ame_maybeWrapGl(const char *name, void **out) {
     // glScissor 与 glViewport 是彼此独立的 GL 状态，必须一并修正，否则绘制
     // 会被残留的 scissor box 裁掉（详见 ame_glScissor 处注释）。
     if (strcmp(name, "glScissor") == 0) {
-        if (ame_real_glScissor == NULL && ame_glSymbolTrusted(*out))
+        // [fix/mg-recursion] 与下方 3059 处同理:句柄自解析 / 已是我们的钩子时必须放行。
+        // 少了这道判定, MobileGlues 在 constructor 里 dlsym(gles_handle, "glScissor")
+        // 会被接管并把 ame_real_glScissor 写成 ame_glScissor 自己, 于是钩子每次调用
+        // 都回环到自身 -> 5642 层无限递归 -> 击穿栈保护区 ->
+        // EXC_BAD_ACCESS(KERN_PROTECTION_FAILURE, SIGILL/SIGBUS) 崩溃。
+        if (*out == (void *)ame_glScissor) return;
+        if (ame_real_glScissor == NULL) {
+            if (!ame_glSymbolTrusted(*out)) return;   // 不可信 -> 不缓存也不包装
             ame_real_glScissor = (ame_fn_glScissor)*out;
-        if (ame_real_glScissor != NULL) *out = (void *)ame_glScissor;
+        }
+        // 兜底: 万一还是解析成自己, 绝不能再包装一次
+        if (ame_real_glScissor != NULL && ame_real_glScissor != ame_glScissor
+            && *out != (void *)ame_glScissor)
+            *out = (void *)ame_glScissor;
         return;
     }
     if (strcmp(name, "glViewport") != 0) return;
-    if (ame_real_glViewport == NULL && ame_glSymbolTrusted(*out))
+    // [fix/mg-recursion] 与 glScissor 分支同款三段 guard：句柄自解析 / 已是
+    // 我们的钩子时必须放行，否则 ame_real_glViewport 会被缓存成 ame_glViewport
+    // 自己（ame_glSymbolTrusted 只排除系统框架，本镜像的钩子能通过校验），
+    // 每次调用回环到自身 -> 栈溢出。glScissor 的 5642 层递归崩溃栈已实证此
+    // 模式；glViewport 与其完全对称，仅是尚未被同一时序踩中。
+    if (*out == (void *)ame_glViewport) return;
+    if (ame_real_glViewport == NULL) {
+        if (!ame_glSymbolTrusted(*out)) return;   // 不可信 -> 不缓存也不包装
         ame_real_glViewport = (ame_fn_glViewport)*out;
-    // 仅在真实指针可信时才换上包装；否则原样放行，绝不包装一份系统桩。
-    if (ame_real_glViewport != NULL) *out = (void *)ame_glViewport;
+    }
+    // 兜底: 万一还是解析成自己, 绝不能再包装一次
+    if (ame_real_glViewport != NULL && ame_real_glViewport != ame_glViewport
+        && *out != (void *)ame_glViewport)
+        *out = (void *)ame_glViewport;
 }
 
 // 把原始指针换成代理。orig 为 NULL 时不覆盖（ZL2 语义：首次解析后固定）。
+// [fix/mg-recursion] 三个分支统一补前置 guard：*out 已是代理时直接放行。
+// 若无此判定，代理指针回流（如 SDL/LWJGL 二次解析拿到上次被换过的值）且
+// orig 尚未缓存时，ame_orig_* 会被写成代理自己 -> 代理调 orig -> 无限递归。
+// 与 ame_maybeWrapGl 的 glScissor/glViewport 修复同一模式。
 static void ame_maybeWrapEgl(const char *name, void **out) {
     if (name == NULL || *out == NULL) return;
     if (strcmp(name, "eglChooseConfig") == 0) {
+        if (*out == (void *)ame_proxyEglChooseConfig) return;
         if (ame_orig_eglChooseConfig == NULL) ame_orig_eglChooseConfig = (ame_fn_eglChooseConfig)*out;
         if (*out != (void *)ame_proxyEglChooseConfig) *out = (void *)ame_proxyEglChooseConfig;
     } else if (strcmp(name, "eglCreateContext") == 0) {
+        if (*out == (void *)ame_proxyEglCreateContext) return;
         if (ame_orig_eglCreateContext == NULL) ame_orig_eglCreateContext = (ame_fn_eglCreateContext)*out;
         if (*out != (void *)ame_proxyEglCreateContext) *out = (void *)ame_proxyEglCreateContext;
     } else if (strcmp(name, "eglSwapBuffers") == 0) {
+        if (*out == (void *)ame_proxyEglSwapBuffers) return;
         if (ame_orig_eglSwapBuffers == NULL) ame_orig_eglSwapBuffers = (ame_fn_eglSwapBuffers)*out;
         if (*out != (void *)ame_proxyEglSwapBuffers) *out = (void *)ame_proxyEglSwapBuffers;
     }

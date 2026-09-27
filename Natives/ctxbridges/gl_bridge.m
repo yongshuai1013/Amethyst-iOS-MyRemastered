@@ -1438,16 +1438,19 @@ static BOOL ame_mgBootstrap(EGLDisplay dpy, EGLConfig config) {
     // 4) 把生命周期 EGL 切换到 MobileGlues 前端（此后 eglCreateContext 会建立
     //    MGContext 记录、eglMakeCurrent 会绑定 g_current_ctx 与每上下文子系统，
     //    eglSwapBuffers 走 presentSurface）。任一符号缺失则单独回退 raw。
-    // SFPEW 叠加时生命周期指针必须留在 SFPEW 上：SFPEW 的 wrapper 会转发给
-    // MobileGlues 前端（它 dlopen 的后端就是 libmobileglues.dylib），直接换成
-    // 前端会把 SFPEW 整层绕开，固定管线仿真根本不安装。此时 bootstrap 的价值
-    // 是「mg_init_gles 已跑、MG 后端句柄已绑定」，而非切换函数指针。
-    if (isSFPEWRenderer(getenv("AMETHYST_RENDERER"))) {
-        NSLog(@"[MG-Bridge] bootstrap: mg_init_gles done under SFPEW overlay -- "
-              @"lifecycle EGL stays on SFPEW (it forwards to the MobileGlues frontend)");
-        ame_mgFrontendActive = YES;
-        return YES;
-    }
+    //
+    // [fix/sfpew-split-egl] SFPEW 叠加（后端 = mobileglues）时同样必须走这里的
+    // 切换 —— 19ef078d 已把 SFPEW 的生命周期特判删除、handle.egl* 一律来自
+    // dl_handle，而 dl_handle 对非 selfEgl 渲染器（mobileglues 即是）是 ANGLE。
+    // 若在此 early-return，context 会是 ANGLE 的 ES context、GL 却是 MG 的
+    // （LWJGL -> SFPEW -> MG gl*），MG 的 per-context 状态为 NULL —— 这正是
+    // SFPEW + MobileGlues 在 1.7.10 上 glTexImage2D 崩溃、"No context is
+    // current" x8、glCheckFramebufferStatus 返回垃圾值的成因。
+    // 对齐安卓模型（Amethyst-Android egl_loader.c）：dl_handle 本来就是
+    // libmobileglues.so（MG 前端），eglCreateContext/eglMakeCurrent 从前端
+    // 解析 —— context 从头到尾都是 MG 的，SFPEW 只承担 GL 转发（renderLibrary），
+    // 其 EGL 导出一次都不会被调用。iOS 侧等价物 = 与非叠加 mobileglues 完全
+    // 相同的 AME_MG_SWAP 路径。
 
     void *fn = NULL;
     #define AME_MG_SWAP(field, name)                                                  \

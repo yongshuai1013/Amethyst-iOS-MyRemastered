@@ -315,6 +315,276 @@ def patch_format_to_compat(root: Path) -> None:
         print("patch_sfpew_ios: verified -- no std::format left in tree")
 
 
+ES_DETECT_HELPER = '''
+// {marker}: iOS 上 backend “是否 OpenGL ES” 的判定在 SFPEW 内部并不统一：
+//   sfpewDesktopGLVersion()   strstr(raw, "OpenGL ES ")      带尾随空格
+//   detect_backend_target()   strstr(version, "OpenGL ES")   不带尾随空格
+// MobileGL-gles 的自述串 "4.6.0 MobileGL 26.09-dev, Direct (OpenGL ES) Backend"
+// 里 "OpenGL ES" 后面紧跟右括号而不是空格，于是带空格版本判“非 ES”、不带空格
+// 版本判“ES”，同一个后端在两个函数里结论相反。
+//
+// 默认取“带空格”那一支，理由（实测，非推断）：MobileGL-gles 是
+// desktop GL 4.6 -> ES 3.0 的转译层，它对外报 4.6、内部是 ES 3.0，
+// 也就是说它的输入契约是 desktop GLSL，desktop->ES 由它自己完成。
+// 安卓那边的 mobileglues 自述串 "4.0.0 MobileGlues 1.3.5" 不含
+// "OpenGL ES"，detect_backend_target() 判它为 desktop，转译目标
+// GLSL 4.x0，光影包能开 —— 这正是我们要镜像的模型。
+// 若按不带空格判成 ES，转译目标会落成 ESSL 300，desktop GLSL 120
+// 的光影包转译失败后回退原码，原码在 ES 上下文里编译报
+// "'texture' : can't use function syntax on variable"，于是黑屏。
+// 带空格仍能正确识别真 ES 后端（"OpenGL ES 3.0"），只有
+// "(OpenGL ES)" 这类描述性后缀不再误判。
+// 逃逸阀（不用重新构建）：
+//   AMETHYST_SFPEW_BACKEND_ES=0  -> 强制按桌面 backend 判定
+//   AMETHYST_SFPEW_BACKEND_ES=1  -> 强制按 ES backend 判定
+static int sfpewIosBackendReportsES(const char* version) {{
+    const char* override = std::getenv("AMETHYST_SFPEW_BACKEND_ES");
+    if (override != nullptr && override[0] != '\\0') {{
+        return std::strcmp(override, "0") == 0 ? 0 : 1;
+    }}
+    return std::strstr(version, "OpenGL ES ") != nullptr ? 1 : 0;
+}}
+'''.format(marker=MARKER)
+
+
+def patch_backend_es_detect(root: Path) -> None:
+    """让 backend 的 “OpenGL ES” 判定与 sfpewDesktopGLVersion() 对齐。
+
+    只做两件事：注入 sfpewIosBackendReportsES()，并把 detect_backend_target()
+    里那句裸 strstr 换成调用它。默认取“带尾随空格”那一支，与上游
+    sfpewDesktopGLVersion() 的写法一致，于是 MobileGL-gles 这类
+    “对外报 desktop、内部是 ES” 的转译层被正确地按 desktop backend 处理
+    （转译目标 GLSL 4.x0，desktop->ES 交给后端自己完成）；真正的 ES 后端
+    （"OpenGL ES 3.0"）不受影响。
+    逃逸阀 AMETHYST_SFPEW_BACKEND_ES=0 / 1 仍可在运行时强制任一方向。
+    """
+    translator = root / "SimpleFPEWrapper" / "shader" / "translator.cpp"
+    if not translator.is_file():
+        fail(f"missing {translator}")
+    t = translator.read_text(encoding="utf-8")
+    if "sfpewIosBackendReportsES" in t:
+        print("patch_sfpew_ios: backend ES detect: already patched -- skip")
+        return
+
+    replace_once(
+        translator,
+        "target_language_t detect_backend_target() {",
+        ES_DETECT_HELPER + "\ntarget_language_t detect_backend_target() {",
+        "backend ES detect (helper insertion)",
+    )
+    replace_once(
+        translator,
+        'if (version != nullptr && std::strstr(version, "OpenGL ES") != nullptr) {',
+        "if (version != nullptr && sfpewIosBackendReportsES(version) != 0) {",
+        "backend ES detect (call site)",
+    )
+
+
+GL_VERSION_OVERRIDE_HELPER = '''
+#include <cstdlib>
+#include <string>
+// {marker}: iOS 上 SFPEW 对外上报的 desktop GL / GLSL 级别覆盖开关。
+//
+// 背景（两份实测日志 + 源码行为，非推断）：
+//   安卓 FCL「SFPEW + MobileGlues 开 BSL 光影」实测通过：后端自述
+//   "4.0.0 MobileGlues 1.3.5"，SFPEW 据此上报 "4.0 SFPEW ... (4.0.0
+//   MobileGlues 1.3.5)"，OptiFine 解析出 MC_GLSL_VERSION 400，光影正常。
+//   iOS「SFPEW + MobileGL-gles」实测黑屏：MobileGL-gles 自述
+//   "4.6.0 MobileGL 26.09-dev, Direct (OpenGL ES) Backend"，SFPEW 照 4.6 上报，
+//   OptiFine 解析出 MC_GLSL_VERSION 460；BSL v10 在 460 分支里生成 texture(...)
+//   函数调用，而文件头仍是 "#version 120" 且声明了 uniform sampler2D texture;
+//   —— GLSL 120 里 texture 不是内建函数，glslang 直接报
+//   "'texture' : can't use function syntax on variable"，转译失败 -> 回退原码 ->
+//   原码同样编译失败 -> program 链接失败 -> 光影黑屏。
+//
+// 把上报级别拉回已验证可行的 400 档即可绕开该矛盾：OptiFine 走 120 分支生成，
+// 不再产出与同名 sampler 冲突的 texture() 调用。
+// 不设环境变量时行为与上游逐字一致（无覆盖）。
+//   AMETHYST_SFPEW_GL_VERSION=40     -> 上报 GL 4.0 / GLSL 4.00（安卓实测可行档）
+//   AMETHYST_SFPEW_GL_VERSION=4.0    同上；46 / 4.6 / 330 / 3.30 同理。
+static void sfpewIosApplyGlVersionOverride(int* major, int* minor) {{
+    if (major == nullptr || minor == nullptr) return;
+    const char* v = std::getenv("AMETHYST_SFPEW_GL_VERSION");
+    if (v == nullptr || v[0] == '\\0') return;
+    const std::string s(v);
+    const size_t dot = s.find('.');
+    int a = 0, b = 0;
+    try {{
+        if (dot == std::string::npos) {{
+            if (s.size() >= 3) {{
+                a = std::stoi(s.substr(0, s.size() - 2));
+                b = std::stoi(s.substr(s.size() - 2));
+            }} else if (s.size() == 2) {{
+                a = std::stoi(s.substr(0, 1));
+                b = std::stoi(s.substr(1));
+            }} else {{
+                return;
+            }}
+        }} else {{
+            a = std::stoi(s.substr(0, dot));
+            const std::string rest = s.substr(dot + 1);
+            b = rest.empty() ? 0 : std::stoi(rest);
+        }}
+    }} catch (...) {{
+        return;
+    }}
+    if (a <= 0) return;
+    *major = a;
+    *minor = b;
+}}
+'''.format(marker=MARKER)
+
+
+def patch_capabilities_es_detect(root: Path) -> None:
+    """让 sfpewBackendIsES() 与 sfpewDesktopGLVersion() 用同一判据。
+
+    patch_backend_es_detect() 只覆盖了 translator.cpp 的 detect_backend_target()，
+    漏了 backend/capabilities.cpp 的 sfpewBackendIsES()——它仍用不带尾随空格的
+    "OpenGL ES"，于是 MobileGL-gles 的 "Direct (OpenGL ES) Backend" 在这一个
+    函数里被判成 ES，而 sfpewDesktopGLVersion()（带空格）判成非 ES：同一个后端
+    在 SFPEW 内部结论相反，能力面自相矛盾。
+
+    sfpewBackendIsES() 决定两件事：
+      * texture_image.cpp 的 glGetTexImage / glGetCompressedTexImage /
+        glGetTexLevelParameteriv —— desktop-only 查询，判成 ES 就不会去查；
+      * sfpewTextureBorderClampSupported() —— 判成 ES 就改查后端扩展串，
+        判成桌面则直接声明 GL_ARB_texture_border_clamp。
+
+    注意：同文件里的 sfpewBackendTakesBgra()（capabilities.cpp:192）用不带空格
+    的 "OpenGL ES" 是**故意**的，不要动——它的判据是「后端是否原生接受 BGRA」，
+    MobileGlues 报桌面版本串但实际不重排 BGRA 字节，必须靠无空格匹配才能把它
+    和真 ES 一起识别出来（源码里那段注释就是这个意思）。
+
+    逃逸阀 AMETHYST_SFPEW_BACKEND_ES=0/1 与 translator.cpp 那份共用，一处设置
+    两个函数同时生效。
+    """
+    caps = root / "SimpleFPEWrapper" / "backend" / "capabilities.cpp"
+    if not caps.is_file():
+        fail(f"missing {caps}")
+    t = caps.read_text(encoding="utf-8")
+    if "sfpewIosBackendReportsES" in t:
+        print("patch_sfpew_ios: capabilities ES detect: already patched -- skip")
+        return
+
+    replace_once(
+        caps,
+        "bool sfpewBackendIsES() {",
+        ES_DETECT_HELPER + "\nbool sfpewBackendIsES() {",
+        "capabilities ES detect (helper insertion)",
+    )
+    replace_once(
+        caps,
+        '        cached = std::strstr((const char*)raw, "OpenGL ES") != nullptr ? 1 : 0;',
+        "        cached = sfpewIosBackendReportsES((const char*)raw);",
+        "capabilities ES detect (call site)",
+    )
+
+
+def patch_gl_version_override(root: Path) -> None:
+    """给 glGetString 的 GL_VERSION / GL_SHADING_LANGUAGE_VERSION 加级别覆盖。
+
+    只在设置了 AMETHYST_SFPEW_GL_VERSION 时生效，未设置时与上游逐字一致。
+    用于把 OptiFine 的 MC_GLSL_VERSION 从 460（MobileGL-gles 自述 4.6）拉回
+    400（安卓 FCL 实测可行档），绕开 BSL v10 在 "#version 120" 里生成
+    texture() 调用导致的转译失败 + 光影黑屏。
+    """
+    gvs = root / "SimpleFPEWrapper" / "getter_version_strings.cpp"
+    if not gvs.is_file():
+        fail(f"missing {gvs}")
+    t = gvs.read_text(encoding="utf-8")
+    if "sfpewIosApplyGlVersionOverride" in t:
+        print("patch_sfpew_ios: GL version override: already patched -- skip")
+        return
+
+    replace_once(
+        gvs,
+        "const GLubyte* glGetString(GLenum name) {",
+        GL_VERSION_OVERRIDE_HELPER + "\nconst GLubyte* glGetString(GLenum name) {",
+        "GL version override (helper insertion)",
+    )
+    replace_once(
+        gvs,
+        "            if (sfpewDesktopGLVersion(&major, &minor)) {\n"
+        "                // Desktop-parseable level first, then who is answering and",
+        "            if (sfpewDesktopGLVersion(&major, &minor)) {\n"
+        "                sfpewIosApplyGlVersionOverride(&major, &minor);\n"
+        "                // Desktop-parseable level first, then who is answering and",
+        "GL version override (GL_VERSION call site)",
+    )
+    replace_once(
+        gvs,
+        "            if (sfpewDesktopGLVersion(&major, &minor)) {\n"
+        "                const GLubyte* backend = g_glFuncs.glGetString(GL_SHADING_LANGUAGE_VERSION);",
+        "            if (sfpewDesktopGLVersion(&major, &minor)) {\n"
+        "                sfpewIosApplyGlVersionOverride(&major, &minor);\n"
+        "                const GLubyte* backend = g_glFuncs.glGetString(GL_SHADING_LANGUAGE_VERSION);",
+        "GL version override (GLSL call site)",
+    )
+
+    # ---- else 分支：MobileGL-gles 实际走的是这里 ----
+    # sfpewDesktopGLVersion() 用 strstr(raw, "OpenGL ES ")（带尾随空格）判定，
+    # MobileGL-gles 的自述串 "4.6.0 MobileGL 26.09-dev, Direct (OpenGL ES) Backend"
+    # 里 "OpenGL ES" 后面是 ')' 不是空格 -> cached_is_es = 0 -> 函数返回 false。
+    # 于是 glGetString 走 else 分支（原样上报后端串），上面 if 分支里的覆盖对
+    # MobileGL-gles 永远不触发 —— 等于死代码。必须在这里也加一次。
+    replace_once(
+        gvs,
+        """            } else {
+                // A desktop backend's own string already parses, so it stays
+                // first and the wrapper appends itself - with the commit,
+                // same as above: which build answered is the question a
+                // report has to be able to settle either way.
+                cachedVersionString = std::string((const char*)backend) + \" (with \" +
+                                      kSfpewProjectFullName + \" \" + sfpewVersionAndCommit() + \")\";
+            }""",
+        """            } else {
+                // A desktop backend's own string already parses, so it stays
+                // first and the wrapper appends itself - with the commit,
+                // same as above: which build answered is the question a
+                // report has to be able to settle either way.
+                //
+                // iOS: 覆盖开关必须在本分支也生效。MobileGL-gles 的自述串里
+                // \"OpenGL ES\" 后接右括号，sfpewDesktopGLVersion()（带尾随空格匹配）
+                // 判它为 desktop 后端并返回 false，走的正是本 else 分支 ——
+                // 上面 if 分支里的覆盖对它永远是死代码。
+                // 覆盖生效时改用「可解析级别在前」的同一格式，保证 GL_VERSION 与
+                // GL_SHADING_LANGUAGE_VERSION 成对。
+                sfpewIosApplyGlVersionOverride(&major, &minor);
+                if (major > 0) {
+                    cachedVersionString = std::to_string(major) + \".\" + std::to_string(minor) + \" \" +
+                                          kSfpewProjectName + \" \" + sfpewVersionAndCommit() + \" (\" +
+                                          (const char*)backend + \")\";
+                } else {
+                    cachedVersionString = std::string((const char*)backend) + \" (with \" +
+                                          kSfpewProjectFullName + \" \" + sfpewVersionAndCommit() + \")\";
+                }
+            }""",
+        "GL version override (else branch, GL_VERSION)",
+    )
+    replace_once(
+        gvs,
+        """            } else {
+                const GLubyte* backend = g_glFuncs.glGetString(GL_SHADING_LANGUAGE_VERSION);
+                if (!backend) return nullptr;
+                cachedGlslString = (const char*)backend;
+            }""",
+        """            } else {
+                // iOS: 同上，MobileGL-gles 走本分支，覆盖必须在此生效。
+                sfpewIosApplyGlVersionOverride(&major, &minor);
+                if (major > 0) {
+                    const GLubyte* be = g_glFuncs.glGetString(GL_SHADING_LANGUAGE_VERSION);
+                    cachedGlslString = std::to_string(major) + \".\" + std::to_string(minor) +
+                                       \"0 SFPEW (\" + (be ? (const char*)be : \"\") + \")\";
+                } else {
+                    const GLubyte* backend = g_glFuncs.glGetString(GL_SHADING_LANGUAGE_VERSION);
+                    if (!backend) return nullptr;
+                    cachedGlslString = (const char*)backend;
+                }
+            }""",
+        "GL version override (else branch, GLSL)",
+    )
+
+
 def main() -> None:
     if len(sys.argv) != 2:
         fail(f"usage: {sys.argv[0]} <SimpleFPEWrapper source dir>")
@@ -325,6 +595,9 @@ def main() -> None:
     patch_types_h(root)
     patch_float_call_site(root)
     patch_format_to_compat(root)
+    patch_backend_es_detect(root)
+    patch_capabilities_es_detect(root)
+    patch_gl_version_override(root)
 
 
 if __name__ == "__main__":

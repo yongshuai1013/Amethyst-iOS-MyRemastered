@@ -84,7 +84,17 @@ NSString *const PREF_MOD_MIRROR = @"general.mod_mirror";
             // 键必须在此注册：否则 PLPreferences 的 getter/setter 因键不存在而静默
             // 失败（日志刷 "could not find preference video.sfpew_overlay"），
             // 设置页开关既读不出也存不下。
-            @"sfpew_overlay": @NO
+            @"sfpew_overlay": @NO,
+            // 启动器侧 FSR1（EASU 边缘自适应上采样 + RCAS 锐化）开关。
+            // 与 sfpew_overlay 完全同款的要求：键必须在此注册。否则
+            //   * getPrefBool(@"video.fsr1") 恒返回 NO（getObject 取到 nil）
+            //   * setPrefObject(@"video.fsr1") 静默失败并打日志
+            //     "[PLPreferences] Setter could not find preference video.fsr1"
+            // 后果是设置页开关存不下来、重开即回退为关，ameFsr1Wanted() 永远为假，
+            // FSR1 一次都不介入且日志里一个 [FSR1] 字样都没有 —— 用户看到的就是
+            // "开了没效果、开关自己关了"。
+            // 默认关闭（opt-in）。且它只在 video.resolution < 100% 时才介入。
+            @"fsr1": @NO
         }.mutableCopy,
         @"control": @{
             @"default_ctrl": @"default.json",
@@ -200,6 +210,10 @@ NSString *const PREF_MOD_MIRROR = @"general.mod_mirror";
             @"debug_universal_script_jit": @NO,
             @"debug_always_attached_jit": @NO,
             @"debug_skip_wait_jit": @NO,
+            // Task 134（参照 Air）：JIT 开启工具选择（auto = 原自动判定）与
+            // iOS 26 JS 脚本 JIT 开关（默认携带脚本）
+            @"jit_enabler": @"auto",
+            @"jit26_script_disable": @NO,
             @"debug_hide_home_indicator": @NO,
             @"debug_ipad_ui": @(realUIIdiom == UIUserInterfaceIdiomPad),
             @"debug_auto_correction": @YES,

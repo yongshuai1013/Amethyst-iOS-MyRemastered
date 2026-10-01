@@ -245,6 +245,7 @@
 "preference.title.renderer.debug.zink" = "Zink（Mesa 25.0.7）- OpenGL 4.1";
 "preference.title.renderer.debug.ltw" = "LTW （1.17+）- gl2es（严重不稳定）";
 "preference.title.renderer.debug.vulkan" = "MoltenVK（26.2+）- Vulkan 1.4";
+"preference.title.renderer.debug.nggl4es" = "Krypton Wrapper（≤26.2）- ZL2 同款 gl4es，老版本首选（原 NG-GL4ES）";
 
 "preference.detail.renderer" = "更改使用的渲染器";
 
@@ -1954,3 +1955,31 @@
 
 "preference.auto" = "自动";
 "preference.auto_select" = "自动选择";
+
+"i18n_str_jit26_pending" = "JIT：已启用（启动时自动附加）";
+"jit.timeout_retry_msg" = "等待 JIT 超时（120 秒），JIT 工具可能未响应。点重试可再试一次，也可手动附加调试器后重试。";
+"jit.retry" = "重试";
+
+// Task 134: JIT 开启工具选择（参照 Air 移植）
+"preference.debug.jit_enabler.auto" = "自动（推荐）";
+"preference.debug.jit_enabler.stikjit" = "StikDebug / StikJIT";
+"preference.debug.jit_enabler.sidestore" = "SideStore";
+"preference.debug.jit_enabler.stosdebug" = "StosDebug";
+"preference.debug.jit_enabler.jitstreamer" = "JitStreamer-EB";
+"preference.debug.jit_enabler.trollstore" = "TrollStore";
+"preference.debug.jit_enabler.manual" = "手动（自行附加调试器）";
+"preference.title.jit_enabler" = "JIT 开启工具";
+"preference.detail.jit_enabler" = "选择用于开启 JIT 的工具。没有安装 StikDebug 的用户请改选 SideStore、StosDebug、JitStreamer-EB 或 TrollStore，否则点击启动可能没有任何反应。默认自动：按设备状态依次尝试 TrollStore、StikDebug、SideStore。";
+"preference.title.jit26_script_disable" = "禁用 iOS 26 JS 脚本 JIT";
+"preference.detail.jit26_script_disable" = "启动游戏时不再向 JIT 工具发送 UniversalJIT26.js 脚本（纯调试器附加式 JIT）。仅当你的工具不支持脚本、或脚本导致异常时才需要开启；依赖系统级内存映射的设备（TXM）开启后可能无法启动游戏。";
+"i18n_str_jit26_not_ready" = "JIT26 调试器未就绪：JIT 断点无人应答。请确认已在 StikDebug 中指定 Universal JIT 脚本并重新开启 JIT，然后再点击启动。";
+
+// 启动器检查更新（ZL2 风格弹窗 + 启动自动检查）
+"update_dialog.title" = "发现新版本";
+"update_dialog.version_from" = "%@（当前：%@）";
+"update_dialog.published_at" = "发布于 %@";
+"update_dialog.ignore" = "忽略此版本";
+"update_dialog.later" = "稍后";
+"update_dialog.update" = "更新";
+"preference.title.auto_check_update" = "启动时检查更新";
+"preference.detail.auto_check_update" = "启动启动器时自动检查 GitHub Releases。每小时最多检查一次，被你选择忽略的版本不会再提示。";

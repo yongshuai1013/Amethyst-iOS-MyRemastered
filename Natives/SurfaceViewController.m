@@ -16,6 +16,7 @@
 #import "MinecraftResourceUtils.h"
 #import "PLProfiles.h"
 #import "SurfaceViewController.h"
+#import "fsr1/ame_fsr1.h"
 #import "utils.h"
 #import "GameMenuOverlayView.h"
 #import "TrackedTextField.h"
@@ -1105,6 +1106,8 @@ static UIView *findSDL_uikitview(UIView *root);
     self.inputTextField.delegate = self;
     self.inputTextField.font = [UIFont fontWithName:@"Menlo-Regular" size:20];
     self.inputTextField.clearsOnBeginEditing = YES;
+    // 默认拦截 SDL/IME 侧的临时 resign（Amethyst-JP 同款防护），显式开关处临时放行。
+    self.inputTextField.preventUnexpectedResign = YES;
     self.inputTextField.textAlignment = NSTextAlignmentCenter;
     self.inputTextField.sendChar = ^(jchar keychar){ CallbackBridge_nativeSendChar(keychar); };
     self.inputTextField.sendCharMods = ^(jchar keychar, int mods){ CallbackBridge_nativeSendCharMods(keychar, mods); };
@@ -1324,7 +1327,20 @@ static UIView *findSDL_uikitview(UIView *root);
         NSLog(@"[SurfaceVC] video.resolution invalid (%.4f) -> falling back to 100%%", resolutionScale);
         resolutionScale = 1.0f;
     }
-    self.surfaceView.layer.contentsScale = self.screenScale * resolutionScale;
+    // —— FSR1（启动器侧上采样）——
+    // FSR1 接管缩放时，几何分工与常规缩放相反：
+    //   * surface / drawable 必须是全分辨率 —— 它是 framebuffer 0，FSR1 要在这个
+    //     分辨率上输出，也是最终 present 的面
+    //   * 交给 MC 的 windowWidth/Height 仍是缩放后的值 —— MC 因此按低分辨率设
+    //     viewport，画面落在 surface 左下角，由 fsr1 在 swap 前上采样铺满
+    // 若此处仍按常规把 surface 也缩掉，FSR1 就没有全分辨率的目标可写，且
+    // CoreAnimation 会先做一次双线性拉伸，等于把 EASU 的边缘自适应丢掉。
+    const BOOL fsr1FullResSurface = ameFsr1NeedsFullResSurface();
+    const CGFloat fsrSurfaceContentsScale = fsr1FullResSurface
+        ? self.screenScale
+        : (self.screenScale * resolutionScale);
+
+    self.surfaceView.layer.contentsScale = fsrSurfaceContentsScale;
 
     physicalWidth = roundf(self.surfaceView.frame.size.width * self.screenScale);
     physicalHeight = roundf(self.surfaceView.frame.size.height * self.screenScale);
@@ -1361,15 +1377,28 @@ static UIView *findSDL_uikitview(UIView *root);
         // drawableSize —— 此期由 gl_bridge 的几何重对齐独占写权保持 present
         // 自洽；本函数若继续写会与之每帧拉锯 = 画面分裂（Air Task53 同款 gate）。
         // 重对齐成功后 surface==drawable==bounds 像素，本写入变为同值 no-op。
+        // FSR1 接管时写全分辨率（physical），否则维持原语义（windowWidth/Height）
+        const CGFloat drawW = fsr1FullResSurface ? MAX(physicalWidth, 1)  : MAX(windowWidth, 1);
+        const CGFloat drawH = fsr1FullResSurface ? MAX(physicalHeight, 1) : MAX(windowHeight, 1);
+        // FSR1 接管时**必须**写 drawableSize，不能被下面的失配 gate 拦掉：
+        // 此时 surface 是全分辨率、MC 按低分辨率绘制，二者「失配」正是 FSR1
+        // 上采样的输入前提，于是 Task53 的 ame_gl_surface_transposed() 恒为
+        // 真。若沿用该 gate，drawableSize 会被整段跳过、停留在上一次的低分
+        // 辨率值，而 ANGLE 已按新的 contentsScale(=screenScale) 把 EGL
+        // surface 建成全分辨率 —— present 的全分辨率 backbuffer 被塞进低分
+        // 辨率 drawable，CoreAnimation 再把它拉伸上屏，表现就是「画面跑到
+        // 左下角、被放大且超出屏幕」。FSR1 场景下 surface == drawable ==
+        // bounds x contentsScale == physical 恒成立，此处写入是治愈而非与
+        // 重对齐链拉锯。
         if (ame_gl_surface_owns_layer()) {
-            if (!ame_gl_surface_transposed()) {
-                metalLayer.drawableSize = CGSizeMake(MAX(windowWidth, 1), MAX(windowHeight, 1));
-                NSLog(@"[SurfaceVC] drawableSize=%dx%d (contentsScale %.2f, resolution %.0f%%)",
+            if (fsr1FullResSurface || !ame_gl_surface_transposed()) {
+                metalLayer.drawableSize = CGSizeMake(drawW, drawH);
+                NSLog(@"[SurfaceVC] drawableSize=%dx%d (contentsScale %.2f, resolution %.0f%%, fsr1FullResSurface=%d)",
                       (int)metalLayer.drawableSize.width, (int)metalLayer.drawableSize.height,
-                      metalLayer.contentsScale, resolutionScale * 100.0f);
+                      metalLayer.contentsScale, resolutionScale * 100.0f, (int)fsr1FullResSurface);
             }
         } else {
-            metalLayer.drawableSize = CGSizeMake(MAX(windowWidth, 1), MAX(windowHeight, 1));
+            metalLayer.drawableSize = CGSizeMake(drawW, drawH);
             NSLog(@"[SurfaceVC] drawableSize=%dx%d (contentsScale %.2f, resolution %.0f%%)",
                   (int)metalLayer.drawableSize.width, (int)metalLayer.drawableSize.height,
                   metalLayer.contentsScale, resolutionScale * 100.0f);
@@ -1902,9 +1931,12 @@ static BOOL ame87_mcVersionRequiresTextureBuffer(NSString *mcVersionId) {
 
     if (gestureRecognizer.state == UIGestureRecognizerStateBegan) {
         if (self.inputTextField.isFirstResponder) {
+            self.inputTextField.preventUnexpectedResign = NO;
             [self.inputTextField resignFirstResponder];
+            self.inputTextField.preventUnexpectedResign = YES;
             self.inputTextField.alpha = 1.0f;
         } else {
+            self.inputTextField.preventUnexpectedResign = YES;
             [self.inputTextField becomeFirstResponder];
             self.inputTextField.text = @" ";
         }
@@ -2159,9 +2191,12 @@ static BOOL ame87_mcVersionRequiresTextureBuffer(NSString *mcVersionId) {
                 case SPECIALBTN_KEYBOARD:
                     if (held == 0) {
                         if (self.inputTextField.isFirstResponder) {
+                            self.inputTextField.preventUnexpectedResign = NO;
                             [self.inputTextField resignFirstResponder];
+                            self.inputTextField.preventUnexpectedResign = YES;
                             self.inputTextField.alpha = 1.0f;
                         } else {
+                            self.inputTextField.preventUnexpectedResign = YES;
                             [self.inputTextField becomeFirstResponder];
                             self.inputTextField.text = @" ";
                         }

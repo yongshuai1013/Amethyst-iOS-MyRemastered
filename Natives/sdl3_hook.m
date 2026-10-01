@@ -1909,8 +1909,11 @@ typedef void (*ame_fn_glScissor)(int32_t x, int32_t y,
                                  int32_t width, int32_t height);
 
 static ame_fn_glScissor ame_real_glScissor = NULL;
+// [fix/mg-recursion-3] 前置声明: 定义在使用点之后, C 需要先见到原型, 否则隐式声明报错。
+static ame_fn_glGetIntegerv ame_resolve_glGetIntegerv(void);
 static int ame_glScissorLogBudget = 8;
-static void ame_glScissor(int32_t x, int32_t y, int32_t width, int32_t height);
+static void ame_glScissor(int32_t x, int32_t y, int32_t width, int32_t height);      // 外层(重入保护)
+static void ame_glScissor_impl(int32_t x, int32_t y, int32_t width, int32_t height); // 真正实现
 
 // 判断某个 viewport 是否为「已知的错误候选」。只做精确匹配，不做比例推断，
 // 以免误伤渲染到 FBO 时的合法小 viewport（阴影贴图、GUI 元素、缩略图等）。
@@ -1978,8 +1981,19 @@ static bool ame_glSymbolTrusted(const void *sym) {
     Dl_info info;
     if (dladdr(sym, &info) == 0 || info.dli_fname == NULL) return false;
     const char *img = info.dli_fname;
-    return (strstr(img, "OpenGLES.framework") == NULL &&
-            strstr(img, "OpenGL.framework") == NULL);
+    if (strstr(img, "OpenGLES.framework") != NULL) return false;
+    if (strstr(img, "OpenGL.framework") != NULL) return false;
+    // [fix/mg-recursion-6] 关键: 我们自己镜像里的"GL 入口点"其实就是我们的钩子。
+    // 之前这里只拒系统框架, 于是每条解析路径(dlsym / 包装 / 句柄表 / 状态自查)都可能
+    // 把 ame_glScissor 之类当成"可信的真实实现"缓存下来, 钩子随即调用自己 ->
+    // 无限递归(崩溃报告 recursionInfoArray: depth 5707, keyFrame symbol ame_glScissor)
+    // -> 栈保护击穿 -> EXC_BAD_ACCESS / SIGILL。逐个堵回路治不完, 把信任判定收紧到
+    // "不接受自家镜像 / 不接受已知钩子符号"才是根治。
+    if (strstr(img, "AngelAuraAmethyst") != NULL) return false;      // 主二进制(我们的钩子都在这里)
+    if (strstr(img, "/App.app/") != NULL) return false;
+    if (sym == (const void *)ame_glScissor) return false;
+    if (sym == (const void *)ame_glViewport) return false;
+    return true;
 }
 
 static ame_fn_glViewport ame_resolve_glViewport(void) {
@@ -2609,9 +2623,8 @@ static void ame_logGLStateOnce(const char *tag) {
     if (ame_glStateLogBudget <= 0) return;
     void *rh = ame_rendererHandle();
     if (rh == NULL) return;
-    void *p = dlsym(rh, "glGetIntegerv");
-    if (p == NULL || !ame_glSymbolTrusted((const void *)p)) return;
-    ame_fn_glGetIntegerv giv = (ame_fn_glGetIntegerv)p;
+    ame_fn_glGetIntegerv giv = ame_resolve_glGetIntegerv();   // [fix/mg-recursion-3] 缓存解析
+    if (giv == NULL) return;
     int32_t vp[4] = {0, 0, 0, 0};
     int32_t sc[4] = {0, 0, 0, 0};
     int32_t st = 0, fb = 0;
@@ -2622,6 +2635,33 @@ static void ame_logGLStateOnce(const char *tag) {
     ame_glStateLogBudget--;
     NSDebugLog(@"[SDLHook][glstate] %s viewport=%dx%d scissor=%dx%d scissorTest=%d fb=%d",
                tag, vp[2], vp[3], sc[2], sc[3], st, fb);
+}
+
+// [fix/mg-recursion-3] glGetIntegerv 的统一解析器: 取一次 -> 可信校验 -> 缓存。
+// 之前多处(glstate 记录 / ame_fixStaleScissor / ame_currentFramebufferBinding)都在热路径
+// 里每次 dlsym("glGetIntegerv") 并直接调用;若那次 dlsym 命中我们自己的 glGetIntegerv 钩子,
+// 调用会绕回 glScissor 钩子 -> 与 ame_currentFramebufferBinding 形成
+//   ame_glScissor <-> ame_currentFramebufferBinding
+// 的无限递归(崩溃报告 recursionInfoArray: depth 5643 -> 栈保护击穿 -> EXC_BAD_ACCESS/SIGILL)。
+// 统一走本函数即可: 只解析一次, 且解析期间置深度以防重入。
+static ame_fn_glGetIntegerv ame_cached_glGetIntegerv = NULL;
+static int ame_giv_resolve_depth = 0;
+
+static ame_fn_glGetIntegerv ame_resolve_glGetIntegerv(void) {
+    if (ame_cached_glGetIntegerv != NULL &&
+        ame_glSymbolTrusted((const void *)ame_cached_glGetIntegerv)) {
+        return ame_cached_glGetIntegerv;
+    }
+    ame_cached_glGetIntegerv = NULL;
+    if (ame_giv_resolve_depth > 0) return NULL;   // 重入: 不解析, 让调用方保守放行
+    void *rh = ame_rendererHandle();
+    if (rh == NULL) return NULL;
+    ame_giv_resolve_depth++;
+    void *p = dlsym(rh, "glGetIntegerv");
+    ame_giv_resolve_depth--;
+    if (p == NULL || !ame_glSymbolTrusted((const void *)p)) return NULL;
+    ame_cached_glGetIntegerv = (ame_fn_glGetIntegerv)p;
+    return ame_cached_glGetIntegerv;
 }
 
 static ame_fn_glScissor ame_resolve_glScissor(void) {
@@ -2636,7 +2676,12 @@ static ame_fn_glScissor ame_resolve_glScissor(void) {
         ame_dlsymBypassDepth++;
         p = dlsym(rh, "glScissor");
         ame_dlsymBypassDepth--;
-        if (ame_glSymbolTrusted(p)) ame_real_glScissor = (ame_fn_glScissor)p;
+        // [fix/mg-recursion-4] 关键: dlsym 可能返回【我们自己的 ame_glScissor】(它已被注册成
+        // 该符号的实现)。若把它当"真实实现"缓存, 钩子就会调用自己 ->
+        // ame_glScissor 无限递归(崩溃报告 recursionInfoArray: depth 5707, keyFrame
+        // symbol ame_glScissor symbolLocation 684 -> 栈保护击穿 -> EXC_BAD_ACCESS/SIGILL)。
+        if (p != NULL && p != (void *)ame_glScissor && ame_glSymbolTrusted(p))
+            ame_real_glScissor = (ame_fn_glScissor)p;
     }
     // 同 ame_resolve_glViewport：绝不回退 RTLD_DEFAULT。
     return ame_real_glScissor;
@@ -2653,13 +2698,23 @@ static ame_fn_glScissor ame_resolve_glScissor(void) {
 //
 // 返回 -1 表示无法判定（拿不到可信的 glGetIntegerv），此时调用方应保守放行
 // 原始值 —— 宁可漏修，不可误伤。
+// [fix/mg-recursion-2] 只解析一次并缓存: 之前每次调用都 dlsym("glGetIntegerv"),
+// 若那次 dlsym 命中【我们自己的 glGetIntegerv 钩子】(崩溃报告的 recursionInfoArray
+// 里正是 ame_glScissor -> (hooked_dlsym) -> ame_currentFramebufferBinding -> ame_glScissor
+// 5643 层 -> 栈保护击穿 -> EXC_BAD_ACCESS/KERN_PROTECTION_FAILURE), 就会回环到
+// ame_glScissor 自身。这里与 sdl3_hook 内既有范式(见 ame_nudge_glGetIntegerv)统一:
+// 取一次 -> 可信校验 -> 缓存; 再加一层重入深度保险。
+static ame_fn_glGetIntegerv ame_cfb_glGetIntegerv = NULL;
+static int ame_cfb_depth = 0;
+
 static int32_t ame_currentFramebufferBinding(void) {
-    void *rh = ame_rendererHandle();
-    if (rh == NULL) return -1;
-    void *p = dlsym(rh, "glGetIntegerv");
-    if (p == NULL || !ame_glSymbolTrusted((const void *)p)) return -1;
+    if (ame_cfb_depth > 0) return -1;              // 重入: 保守放行, 绝不再绕一圈
+    ame_fn_glGetIntegerv giv = ame_resolve_glGetIntegerv();   // [fix/mg-recursion-3] 统一解析器
+    if (giv == NULL) return -1;
     int32_t fb = -1;
-    ((ame_fn_glGetIntegerv)p)(0x8CA6 /* GL_FRAMEBUFFER_BINDING */, &fb);
+    ame_cfb_depth++;
+    giv(0x8CA6 /* GL_FRAMEBUFFER_BINDING */, &fb);
+    ame_cfb_depth--;
     return fb;
 }
 
@@ -2683,9 +2738,8 @@ static void ame_fixStaleScissor(int eglW, int eglH) {
     if (ame_real_glScissor == NULL) return;
     void *rh = ame_rendererHandle();
     if (rh == NULL) return;
-    void *p = dlsym(rh, "glGetIntegerv");
-    if (p == NULL || !ame_glSymbolTrusted((const void *)p)) return;
-    ame_fn_glGetIntegerv giv = (ame_fn_glGetIntegerv)p;
+    ame_fn_glGetIntegerv giv = ame_resolve_glGetIntegerv();   // [fix/mg-recursion-3] 缓存解析
+    if (giv == NULL) return;
     int32_t sc[4] = {0, 0, 0, 0};
     giv(0x0C10, sc);  // GL_SCISSOR_BOX
     const char *why = NULL;
@@ -2698,11 +2752,30 @@ static void ame_fixStaleScissor(int eglW, int eglH) {
     }
 }
 
+// [fix/mg-recursion-5] 重入保护(根治版): 崩溃报告的 recursionInfoArray 显示
+// ame_glScissor 深度 5707、keyFrame 就是它自己, 说明钩子被【任何内部路径】绕回自身。
+// 之前那版把深度计数塞进原函数体, 但函数里有多处提前 return, 计数不配平 -> 会永久短路,
+// 所以撤掉了。这里改成【包一层】: 原实现改名 *_impl, 外层只负责"进/出各一次", 无论
+// 内部怎么 return, 计数都配平; 重入时直接空操作返回, 绝不回环。
+static __thread int ame_glScissor_depth = 0;
+
 static void ame_glScissor(int32_t x, int32_t y, int32_t width, int32_t height) {
+    if (ame_glScissor_depth > 0) return;            // 重入: 空操作, 绝不回环
+    ame_glScissor_depth++;
+    ame_glScissor_impl(x, y, width, height);
+    ame_glScissor_depth--;
+}
+
+static void ame_glScissor_impl(int32_t x, int32_t y, int32_t width, int32_t height) {
     if (ame_real_glScissor == NULL) {
         (void)ame_resolve_glScissor();
         if (ame_real_glScissor == NULL) return;  // 拿不到可信实现则原样放行
     }
+    // [fix/mg-recursion-4] 最后一道保险: 若"真实实现"竟是我们自己, 直接返回(空操作),
+    // 绝不回调自身 —— 任何路径把 ame_real_glScissor 写成钩子时都不会再递归。
+    if (ame_real_glScissor == ame_glScissor) return;
+    // 注: 这里曾经加过"深度保险", 但它在本函数里没有配对的递减点(函数体内多处 return),
+    // 会让 glScissor 永久短路、修正失效。上面的"自指判定"已经足够挡住递归, 故移除。
     // 绑定 FBO 时不介入：离屏渲染里的 scissor 尺寸由渲染目标自身决定，与 EGL
     // surface 无关，不适用「应等于 surface」这一前提（见
     // ame_currentFramebufferBinding 处注释）。

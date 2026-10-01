@@ -5,6 +5,7 @@
 #import "LauncherCardLayoutViewController.h"
 #import "LauncherPreferences.h"
 #import "BackgroundManager.h"
+#import "UpdateChecker.h"
 // Terracotta 暂时移除（排查启动崩溃）
 // #import "TerracottaManager.h"
 // #import "TerracottaBridge.h"
@@ -75,6 +76,13 @@ extern UIWindow *mainWindow;
     [[BackgroundManager sharedManager] applyBackgroundToWindow:self.window];
 
     [self showTranslationNoticeIfNeeded];
+
+    // 启动时自动检查启动器更新（参照 ZL2 LauncherUpgradeViewModel.checkOnAppStart）。
+    // 仅当确实存在新版本时才弹窗；请求失败、已是最新、处于限频窗口内一律静默。
+    // 延后一拍执行，等 rootViewController 完成首轮布局后再 present。
+    dispatch_async(dispatch_get_main_queue(), ^{
+        [UpdateChecker performStartupCheckFromPresenter:self.window.rootViewController];
+    });
 
     // Terracotta 暂时移除（排查启动崩溃）
     // if ([TerracottaBridge isAvailable]) {

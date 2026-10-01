@@ -24,8 +24,10 @@ typedef void(^XSTSCallback)(NSString *xsts, NSString *uhs);
         self.authData[@"msaRefreshToken"] = response[@"refresh_token"];
         [self acquireXBLToken:response[@"access_token"] callback:callback];
     } failure:^(NSURLSessionDataTask *task, NSError *error) {
-        if (error.code == NSURLErrorDataNotAllowed) {
-            // The account token is expired and offline
+        if (isConnectivityError(error)) {
+            // 无可用网络时刷新不了 token，但启动器有离线路径，直接走离线
+            // 而不是拒绝启动。旧代码只认 NSURLErrorDataNotAllowed（应用被关蜂窝
+            // 数据），飞行模式/无 Wi-Fi 的 NotConnectedToInternet 反而进失败分支。
             self.authData[@"accessToken"] = @"offline";
             callback(nil, YES);
         } else {

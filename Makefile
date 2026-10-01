@@ -903,7 +903,56 @@ assets:
 	fi
 	echo '[Amethyst v$(VERSION)] assets - end'
 
-payload: native dep_mg dep_shader_shims dep_openal_shim dep_angle_freeze dep_sdl3_guard java jre assets
+# --- dep_nggl4es：NG-GL4ES（"Krypton Wrapper"，BZLZHH/NG-GL4ES，MIT）-----------
+# ZalithLauncher 2 用的 gl4es 分支：能处理更高级的着色器、几乎全 MC 版本可跑。
+# vendored 源码在 ThirdParty/NG-GL4ES（见其 CMakeLists 的 PROVENANCE 头）。
+# 作为独立 cmake 树构建，链接 dep_mg 出来的 glslang 静态库（pin f5f664d 15.0.0 +
+# lvalue-nullguard + pool-zero/size-guards 双崩溃补丁，继承崩溃家族修复；NG 自带的
+# 15.4 头已从树中移除，防头/库漂移）与预编译的 SPIRV-Cross C API impl dylib。
+# 产出 libnggl4es.dylib，由 payload 的 "cp $(WORKINGDIR)/*.dylib" 随包带走。
+# 依赖 dep_mg：glslang 静态库必须先就位（-j 并行下无序，需目标级先决条件）。
+dep_nggl4es: dep_mg
+	echo '[Amethyst v$(VERSION)] dep_nggl4es - start'
+	mg_bindir=$(WORKINGDIR)/mobileglues/3rdparty/glslang; \
+	mg_spirv_a=$$mg_bindir/SPIRV/libSPIRV.a; \
+	[ -f "$$mg_spirv_a" ] || mg_spirv_a=$$(find $(WORKINGDIR)/mobileglues -type f -name libSPIRV.a -print -quit 2>/dev/null); \
+	mg_glslang_a=$$mg_bindir/glslang/libglslang.a; \
+	[ -f "$$mg_glslang_a" ] || mg_glslang_a=$$(find $(WORKINGDIR)/mobileglues -type f -name libglslang.a -print -quit 2>/dev/null); \
+	mg_rl_a=$$mg_bindir/glslang/libglslang-default-resource-limits.a; \
+	[ -f "$$mg_rl_a" ] || mg_rl_a=$$(find $(WORKINGDIR)/mobileglues -type f -name libglslang-default-resource-limits.a -print -quit 2>/dev/null); \
+	if [ -z "$$mg_spirv_a" ] || [ ! -f "$$mg_spirv_a" ] || [ -z "$$mg_glslang_a" ] || [ ! -f "$$mg_glslang_a" ] || [ -z "$$mg_rl_a" ] || [ ! -f "$$mg_rl_a" ]; then \
+		echo "ERROR: [nggl4es] glslang static libs unresolved (spirv=$$mg_spirv_a glslang=$$mg_glslang_a rl=$$mg_rl_a) - dep_mg must run first"; \
+		exit 1; \
+	fi; \
+	extra_glslang_libs=""; \
+	for l in libOGLCompiler.a libOSDependent.a; do \
+		if [ -f "$$mg_bindir/glslang/$$l" ]; then \
+			extra_glslang_libs="$$extra_glslang_libs;$$mg_bindir/glslang/$$l"; \
+		fi; \
+	done; \
+	ngg_libs="$$mg_spirv_a;$$mg_glslang_a;$$mg_rl_a$$extra_glslang_libs"; \
+	echo "[nggl4es] linking against glslang statics: $$ngg_libs"; \
+	mkdir -p $(WORKINGDIR)/nggl4es; \
+	cd $(WORKINGDIR)/nggl4es && cmake \
+		-DMACOS="1" \
+		-DCMAKE_CROSSCOMPILING=true \
+		-DCMAKE_SYSTEM_NAME=Darwin \
+		-DCMAKE_SYSTEM_PROCESSOR=aarch64 \
+		-DCMAKE_OSX_SYSROOT="$(SDKPATH)" \
+		-DCMAKE_OSX_ARCHITECTURES=arm64 \
+		-DCMAKE_OSX_DEPLOYMENT_TARGET=14.0 \
+		-DCMAKE_C_FLAGS="-arch arm64" \
+		-DCMAKE_BUILD_TYPE=RelWithDebInfo \
+		-DNGGL4ES_GLSLANG_INCLUDE="$(SOURCEDIR)/Natives/external/MobileGlues/MobileGlues-cpp/3rdparty;$(SOURCEDIR)/Natives/external/MobileGlues/MobileGlues-cpp/3rdparty/glslang" \
+		-DNGGL4ES_GLSLANG_LIBS="$$ngg_libs" \
+		-DNGGL4ES_SPVC_IMPL="$(SOURCEDIR)/Natives/resources/Frameworks/libspirv-cross-c-shared.0.impl.dylib" \
+		-DNGGL4ES_FRAMEWORK_DIR="$(SOURCEDIR)/Natives/resources/Frameworks" \
+		$(SOURCEDIR)/ThirdParty/NG-GL4ES/ || exit 1
+	cmake --build $(WORKINGDIR)/nggl4es --config RelWithDebInfo -j$(JOBS) --target nggl4es || exit 1
+	cp $(WORKINGDIR)/nggl4es/libnggl4es.dylib $(WORKINGDIR)/ || exit 1
+	echo '[Amethyst v$(VERSION)] dep_nggl4es - end'
+
+payload: native dep_mg dep_shader_shims dep_openal_shim dep_angle_freeze dep_sdl3_guard dep_nggl4es java jre assets
 	echo '[Amethyst v$(VERSION)] payload - start'
 	# Mithril / MobileGL 都是可选渲染器：这里用 - 前缀，任一失败都不阻断主构建。
 	# 缺库时对应渲染器会在设置里自动隐藏（见 LauncherPreferences.m 的存在性过滤）。
@@ -925,6 +974,16 @@ payload: native dep_mg dep_shader_shims dep_openal_shim dep_angle_freeze dep_sdl
 	if [ -f "$(WORKINGDIR)/AngelAuraAmethyst.app/Frameworks/libspirv-cross-c-shared.0.dylib" ] && [ ! -f "$(WORKINGDIR)/AngelAuraAmethyst.app/Frameworks/libspirv-cross.dylib" ]; then \
 		ln -sf libspirv-cross-c-shared.0.dylib $(WORKINGDIR)/AngelAuraAmethyst.app/Frameworks/libspirv-cross.dylib; \
 	fi
+
+	# [fix/shim-overwrite-v2] 收尾: resources 里那几份"真库"必须在 shim 之后【再覆盖一次】。
+	# 原因: WORKINGDIR/*.dylib 里有同名 shim(libshaderc.dylib 111KB / libspirv-cross-c-shared.0.dylib 52KB),
+	# 会覆盖先拷进去的真库, 导致 SPIRV-Cross 拒绝 MSL 后端("Invalid backend", create_compiler backend=3 rc=-4)。
+	# 同时断言: 若覆盖后这三份仍 < 1MB, 直接失败(避免再次静默出货)。
+	# 注意: 只覆盖 spirv-cross 两份。libshaderc.dylib 必须保持 WORKINGDIR 产出的"垫片"版本——
+	# 它导出 ame_master_compile_lock, spvc_shim/shaderc_shim 靠 dlopen+dlsym 拿这个符号做跨库编译总锁;
+	# 换成真库会拿不到锁 -> MG/shaderc 并发进 glslang -> SIGSEGV(glslang::TParseContext::lValueErrorCheck)。
+	# 真实现放在 libshaderc_impl.dylib(垫片按 @loader_path 解析), 不受影响。
+	for f in libspirv-cross-c-shared.0.dylib libspirv-cross.dylib; do 		if [ -f "$(SOURCEDIR)/Natives/resources/Frameworks/$$f" ]; then 			cp -f "$(SOURCEDIR)/Natives/resources/Frameworks/$$f" "$(WORKINGDIR)/AngelAuraAmethyst.app/Frameworks/$$f" || exit 1; 		fi; 		sz=$$(stat -f%z "$(WORKINGDIR)/AngelAuraAmethyst.app/Frameworks/$$f" 2>/dev/null || echo 0); 		if [ "$$sz" -lt 1048576 ]; then echo "ERROR: $$f is only $$sz bytes after restore"; exit 1; fi; 	done
 		cp -R $(SOURCEDIR)/JavaApp/libs/others/* $(WORKINGDIR)/AngelAuraAmethyst.app/libs/ || exit 1
 	cp $(SOURCEDIR)/JavaApp/build/launcher.jar $(SOURCEDIR)/JavaApp/build/patchjna_agent.jar $(SOURCEDIR)/JavaApp/build/patchsvc.jar $(SOURCEDIR)/JavaApp/build/mojang-stubs.jar $(WORKINGDIR)/AngelAuraAmethyst.app/libs/ || exit 1
 	# LWJGL 以双版本 jar 发布，由启动器按 MC 版本在运行时选择其一。

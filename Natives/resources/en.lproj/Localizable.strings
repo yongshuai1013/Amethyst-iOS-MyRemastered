@@ -250,11 +250,16 @@
 "preference.title.renderer.debug.mobilegl_gles" = "MobileGL GLES (1.17+) - OpenGL 3.3 Core via OpenGL ES, EXPERIMENTAL";
 "preference.title.renderer.debug.sfpew" = "SFPEW (<=1.16.x) - fixed-function emulation, backend defaults to MobileGlues, EXPERIMENTAL";
 "preference.title.renderer.debug.metal" = "Metal (metallum)";
+"preference.title.renderer.debug.nggl4es" = "Krypton Wrapper (≤26.2) - ZalithLauncher 2 gl4es, first choice for legacy versions (formerly NG-GL4ES)";
 
 "preference.detail.renderer" = "Change the OpenGL render engine to use. Zink is temporarily disabled on iOS 16 and later to diagnose issues.";
 
 "preference.title.resolution" = "Resolution (%)";
 "preference.detail.resolution" = "Allows you to decrease the game resolution.";
+
+"preference.title.fsr1" = "FSR1 Upscaling";
+"preference.detail.fsr1" = "When Resolution is below 100%, replaces the default bilinear stretch with AMD FSR1 (edge-adaptive upscaling + sharpening): the game renders at the lower resolution and FSR1 restores detail on the way to the screen. Runs above EGL and outside the renderer, so it works with every backend. No effect while Resolution is 100%.";
+
 
 "preference.title.disable_game_vsync" = "Unlock framerate (disable VSync)";
 "preference.detail.disable_game_vsync" = "Minecraft enables VSync by default, which caps FPS at the screen refresh rate (60 or 120). When enabled, the launcher forces VSync off so the game can exceed the refresh rate. Turn off if you prefer VSync or want to reduce heat/battery drain.";
@@ -1961,3 +1966,31 @@
 
 "preference.auto" = "Auto";
 "preference.auto_select" = "Auto";
+
+"i18n_str_jit26_pending" = "JIT: Enabled (attaches on launch)";
+"jit.timeout_retry_msg" = "Timed out waiting for JIT (120s). The JIT tool may not have responded. Tap Retry to try again, or attach a debugger manually and retry.";
+"jit.retry" = "Retry";
+
+// Task 134: JIT enabler picker (ported from Air)
+"preference.debug.jit_enabler.auto" = "Auto (recommended)";
+"preference.debug.jit_enabler.stikjit" = "StikDebug / StikJIT";
+"preference.debug.jit_enabler.sidestore" = "SideStore";
+"preference.debug.jit_enabler.stosdebug" = "StosDebug";
+"preference.debug.jit_enabler.jitstreamer" = "JitStreamer-EB";
+"preference.debug.jit_enabler.trollstore" = "TrollStore";
+"preference.debug.jit_enabler.manual" = "Manual (attach a debugger yourself)";
+"preference.title.jit_enabler" = "JIT Enabler";
+"preference.detail.jit_enabler" = "Choose the app used to enable JIT. If you don't have StikDebug installed, pick SideStore, StosDebug, JitStreamer-EB or TrollStore instead, otherwise tapping Launch does nothing. Auto (default) tries TrollStore, then StikDebug, then SideStore depending on your device.";
+"preference.title.jit26_script_disable" = "Disable iOS 26 JS-Script JIT";
+"preference.detail.jit26_script_disable" = "Stop sending UniversalJIT26.js to the JIT tool when launching the game (plain debugger-attach JIT). Only turn this on if your tool doesn't support scripts or the script misbehaves; devices that need system-level memory mapping (TXM) may fail to launch the game with this enabled.";
+"i18n_str_jit26_not_ready" = "JIT26 debugger is not ready: the JIT breakpoint went unanswered. Please re-enable JIT with the Universal script assigned in StikDebug, then tap Play again.";
+
+// Launcher update check (ZL2 style dialog, startup auto-check)
+"update_dialog.title" = "New version available";
+"update_dialog.version_from" = "%@  (current: %@)";
+"update_dialog.published_at" = "Published %@";
+"update_dialog.ignore" = "Ignore this version";
+"update_dialog.later" = "Later";
+"update_dialog.update" = "Update";
+"preference.title.auto_check_update" = "Check for Updates on Launch";
+"preference.detail.auto_check_update" = "Automatically check GitHub Releases when the launcher starts. At most once per hour; versions you chose to ignore are not shown again.";

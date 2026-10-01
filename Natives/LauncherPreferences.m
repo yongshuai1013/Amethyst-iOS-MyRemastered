@@ -69,7 +69,13 @@ int ame141_currentLaunchAllocMem(void) {
     int deviceMB = (int)(NSProcessInfo.processInfo.physicalMemory >> 20);
     int allocmem;
     if (getPrefBool(@"java.auto_ram")) {
-        CGFloat autoRatio = getEntitlementValue(@"com.apple.private.memorystatus") ? 0.5 : 0.25;
+        // Flux 同款修复：jetsam 上限有两条抬升路径——越狱的
+        // com.apple.private.memorystatus，以及带 profile 签名的
+        // com.apple.developer.kernel.increased-memory-limit。只查前者会把正确
+        // entitled 的包按无 entitlement 的 0.25 算，小堆在加载界面静默 GC 空转。
+        BOOL raisedCeiling = getEntitlementValue(@"com.apple.private.memorystatus")
+            || getEntitlementValue(@"com.apple.developer.kernel.increased-memory-limit");
+        CGFloat autoRatio = raisedCeiling ? 0.5 : 0.25;
         allocmem = (int)roundf(deviceMB * autoRatio);
         NSLog(@"[Task141] launch memory from auto ratio %.2f x %dMB = %d MB", autoRatio, deviceMB, allocmem);
     } else {
@@ -361,7 +367,16 @@ static NSArray<NSDictionary *> *rendererCandidates(void) {
         // 在 pick 控件里按下标配对，插到中间会让这些已存值显示错位。
         @{@"key": @ RENDERER_NAME_METAL,
           @"name": localize(@"preference.title.renderer.debug.metal", nil),
-          @"file": @ RENDERER_NAME_METAL}
+          @"file": @ RENDERER_NAME_METAL},
+        // NG-GL4ES（"Krypton Wrapper"，ZL2 同款 gl4es——glslang+SPIRV-Cross 着色器
+        // 管线，官方口径几乎全版本可跑）。刻意追加在表末（与上方 metal 条目同规则）：
+        // 已有 profile / 全局偏好里存的 renderer 值（libxxx.dylib）在 pick 控件里
+        // 按下标配对，插到中间会让这些已存值显示错位。dylib 由 Makefile 的
+        // dep_nggl4es 目标随包构建——rendererLibraryExists 的存在性过滤天然处理
+        // 构建失败 / 裁剪场景（不会显示一个点了就崩的选项）。
+        @{@"key": @ RENDERER_NAME_NGGL4ES,
+          @"name": localize(@"preference.title.renderer.debug.nggl4es", nil),
+          @"file": @ RENDERER_NAME_NGGL4ES}
     ];
 }
 

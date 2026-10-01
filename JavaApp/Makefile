@@ -61,6 +61,26 @@ $(OUTPUTDIR)/launcher.jar: $(CLASSES) check_empty_classes
 	@echo "Creating $@"
 	@cp -r $(SOURCEDIR)/launcher/META-INF $(basename $@)/ 2>/dev/null || true
 	@$(BOOTJDK)/jar -cf $@ -C $(basename $@) .
+	@# Forge/BootstrapLauncher 的模块解析【只看包名由谁 export】: launcher.jar 与
+	@# mojang-stubs.jar 都带 com/mojang/text2speech 时, 会以
+	@#   java.lang.module.ResolutionException:
+	@#     Modules launcher and mojang.stubs export package com.mojang.text2speech to module logging
+	@# 直接杀掉进程。Task158 已该桩【必须】由 mojang-stubs.jar 提供(它才会被模块化并落在
+	@# MC-BOOTSTRAP 层), 所以这里从 launcher.jar 中剔除该包, 让它只有唯一提供者。
+	@# 注意: 只删【打好的 jar 内条目】, 不动 $(basename $@) 的 class 目录 ——
+	@# mojang-stubs.jar 依赖该目录取类, 不受影响。
+	@# 用"解包 -> 删 -> 重打"而不是 `jar -d`(部分 JDK 的 jar 不支持 -d, 会被 || true 静默吞掉,
+	@# 于是 CI 包里 launcher.jar 仍带着该包 -> Forge 继续 module ResolutionException)。
+	@rm -rf $(OUTPUTDIR)/launcher_strip && mkdir -p $(OUTPUTDIR)/launcher_strip
+	@(cd $(OUTPUTDIR)/launcher_strip && $(BOOTJDK)/jar -xf $(abspath $@))
+	@rm -rf $(OUTPUTDIR)/launcher_strip/com/mojang/text2speech
+	@# [fix/forge-split] MC 自己提供 com/mojang/blaze3d/**; launcher.jar 再带一份会让 Forge 报
+	@#   ResolutionException: Module minecraft contains package com.mojang.blaze3d.platform,
+	@#     module launcher exports package com.mojang.blaze3d.platform to minecraft
+	@rm -rf $(OUTPUTDIR)/launcher_strip/com/mojang/blaze3d
+	@cd $(OUTPUTDIR)/launcher_strip && $(BOOTJDK)/jar -cf $(abspath $@) .
+	@rm -rf $(OUTPUTDIR)/launcher_strip
+	@$(BOOTJDK)/jar -tf $@ | grep -qE '^com/mojang/(text2speech|blaze3d)' && { echo "ERROR: text2speech still present in $@ (Forge split-package guard failed)"; exit 1; } || true
 
 # 按 LWJGL 版本分别产出一个合并 jar（3.3.3 与 3.4.1）。
 #

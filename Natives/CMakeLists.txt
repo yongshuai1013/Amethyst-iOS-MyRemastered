@@ -390,6 +390,7 @@ add_executable(AngelAuraAmethyst
   SurfaceViewController+Navigation.m
   TrackedTextField.m
   egl_bridge.m
+  fsr1/ame_fsr1.m
   ZinkConfig.m
   input_bridge_v3.m
   ios_uikit_bridge.m
@@ -490,6 +491,7 @@ add_executable(AngelAuraAmethyst
 
   # Update checker（参考 FCL/ZL2，使用 GitHub Releases API 检查正式版更新）
   UpdateChecker.m
+  UpdateDialogViewController.m
 
   # Minecraft 新闻（参考 PCL-CE，调用 minecraft-services.net 官方新闻 API）
   MinecraftNewsItem.m

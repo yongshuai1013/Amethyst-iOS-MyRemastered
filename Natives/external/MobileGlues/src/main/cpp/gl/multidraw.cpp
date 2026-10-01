@@ -14,6 +14,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cstdint>
+#include <cstdlib>
 #include <limits>
 #include <string>
 #include <vector>
@@ -751,6 +752,226 @@ static bool prepare_indirect_buffer(const GLsizei* counts, GLenum type, const vo
 // Mode: DrawElements (CPU rebase, no extension required)
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// Mode: DrawElements (CPU rebase, no extension required)
+//
+// 2.0.17 spent, on every *sub-draw* of every multi-draw: one
+// glMapBufferRange(GL_MAP_READ_BIT), one CPU rebase, one glUnmapBuffer and one
+// glBufferData. On a GLES 3.0 host -- ANGLE/Metal, no base-vertex extension, no
+// multi-draw extension, so every glMultiDrawElementsBaseVertex the application
+// issues resolves to this backend -- each of those maps is a round trip to the
+// GPU that has to wait for everything queued ahead of it, and each glBufferData
+// is a fresh driver allocation. MC 26.3's batched renderer issues one
+// multi-draw per chunk section batch, so a frame paid hundreds of GPU->CPU
+// readbacks plus hundreds of buffer allocations for index streams that in most
+// batches did not need to be rewritten at all.
+//
+// Two changes, neither of which alters what is drawn:
+//
+//   1. Nothing to rebase -> draw the stream as it stands. Every basevertex is 0
+//      and the sentinel does not have to be substituted, so the same buffer,
+//      type and offsets go straight to the driver: no map, no copy, no upload.
+//   2. Something to rebase -> rebase the whole multi-draw once: a single map
+//      spanning every sub-draw's range, one upload into the scratch buffer, and
+//      one glDrawElements per sub-draw at its offset in that upload.
+//
+// Anything the batched path refuses -- an unmappable buffer, a null client
+// pointer -- still falls through to mg_md_bv_rebase_per_subdraw, which is the
+// 2.0.17 loop, correct everywhere, and now the slow path rather than the only
+// path.
+// ---------------------------------------------------------------------------
+
+// Task180 probe. MG_MD_PERF=1 prints, every 240 multi-draw calls, how many
+// sub-draws were served without touching the index data and how many readbacks
+// were issued. Off unless the variable is set, so nothing here costs anything
+// in a shipping build.
+static std::atomic<unsigned long long> g_md_perf_calls{0};
+static std::atomic<unsigned long long> g_md_perf_subs{0};
+static std::atomic<unsigned long long> g_md_perf_fast{0};
+static std::atomic<unsigned long long> g_md_perf_maps{0};
+
+static bool mg_md_perf_wanted() {
+    static int cached = -1;
+    if (cached < 0) {
+        const char* v = std::getenv("MG_MD_PERF");
+        cached = (v != nullptr && v[0] == '1') ? 1 : 0;
+    }
+    return cached == 1;
+}
+
+// maps: 0 = served without touching the index data, 1 = one readback for the
+// whole batch, anything larger = one readback per sub-draw (the 2.0.17 loop).
+static void mg_md_perf_account(GLsizei primcount, int maps) {
+    if (!mg_md_perf_wanted()) return;
+    const unsigned long long subs = static_cast<unsigned long long>(primcount > 0 ? primcount : 0);
+    g_md_perf_calls.fetch_add(1, std::memory_order_relaxed);
+    g_md_perf_subs.fetch_add(subs, std::memory_order_relaxed);
+    if (maps == 0) g_md_perf_fast.fetch_add(subs, std::memory_order_relaxed);
+    g_md_perf_maps.fetch_add(static_cast<unsigned long long>(maps > 0 ? maps : 0), std::memory_order_relaxed);
+    if (g_md_perf_calls.load(std::memory_order_relaxed) % 240ULL == 0ULL) {
+        LOG_W_FORCE("[MG] multidraw perf: calls=%llu subs=%llu zero-copy subs=%llu readbacks=%llu",
+                    g_md_perf_calls.load(std::memory_order_relaxed), g_md_perf_subs.load(std::memory_order_relaxed),
+                    g_md_perf_fast.load(std::memory_order_relaxed), g_md_perf_maps.load(std::memory_order_relaxed))
+    }
+}
+
+// One output span: where a sub-draw's rebased indices start and how many there
+// are. A struct rather than std::pair so this file needs no extra header.
+struct mg_md_span_t {
+    size_t start;
+    GLsizei count;
+};
+
+// Rebase the whole multi-draw into one staging upload and draw every sub-draw
+// out of it. Returns false when this batch cannot be served that way.
+static bool mg_md_bv_rebase_batched(GLenum mode, GLsizei* counts, GLenum type, const void* const* indices,
+                                    GLsizei primcount, const GLint* basevertex, GLsizei indexSize,
+                                    GLuint prevElementBuffer, bool restart_enabled, GLuint restart_value) {
+    size_t total = 0;
+    for (GLsizei i = 0; i < primcount; ++i) {
+        if (counts[i] > 0) total += static_cast<size_t>(counts[i]);
+    }
+    if (total == 0) return true; // a legal no-op; nothing to upload, nothing to draw
+
+    // Grown but never shrunk, and thread_local for the same reason 2.0.17's
+    // `rebased` was: nothing in this file takes a lock, and two threads can each
+    // have a current context.
+    static thread_local std::vector<GLuint> rebased;
+    static thread_local std::vector<mg_md_span_t> spans;
+    if (rebased.size() < total) rebased.resize(total);
+    spans.clear();
+    if (spans.capacity() < static_cast<size_t>(primcount)) spans.reserve(static_cast<size_t>(primcount));
+
+    size_t out = 0;
+
+    if (prevElementBuffer != 0) {
+        // One map spanning every sub-draw's range instead of one map per
+        // sub-draw. Each glMapBufferRange(GL_MAP_READ_BIT) is a round trip to
+        // the GPU that has to wait for the commands queued ahead of it, so this
+        // is the whole point of the batched path: N readbacks become one.
+        uintptr_t min_off = ~static_cast<uintptr_t>(0);
+        uintptr_t max_end = 0;
+        for (GLsizei i = 0; i < primcount; ++i) {
+            if (counts[i] <= 0) continue;
+            const uintptr_t off = reinterpret_cast<uintptr_t>(indices[i]);
+            const uintptr_t end = off + static_cast<uintptr_t>(counts[i]) * static_cast<uintptr_t>(indexSize);
+            if (off < min_off) min_off = off;
+            if (end > max_end) max_end = end;
+        }
+
+        // Queried once for the whole batch purely to clamp the range: a map past
+        // the end of the store is a rejected request, and the caller then has to
+        // take the slow path for no reason.
+        GLint buf_size = 0;
+        GLES.glGetBufferParameteriv(GL_ELEMENT_ARRAY_BUFFER, GL_BUFFER_SIZE, &buf_size);
+        if (buf_size <= 0 || min_off >= static_cast<uintptr_t>(buf_size)) return false;
+        if (max_end > static_cast<uintptr_t>(buf_size)) max_end = static_cast<uintptr_t>(buf_size);
+        if (max_end <= min_off) return false;
+
+        // Every sub-draw has to sit inside the clamped range, or the map below
+        // would be read past its end. A batch that does not is no reason to give
+        // up on batching as a whole, but this one goes to the slow loop, which
+        // maps each range on its own and degrades per sub-draw instead.
+        for (GLsizei i = 0; i < primcount; ++i) {
+            if (counts[i] <= 0) continue;
+            const uintptr_t off = reinterpret_cast<uintptr_t>(indices[i]);
+            const uintptr_t end = off + static_cast<uintptr_t>(counts[i]) * static_cast<uintptr_t>(indexSize);
+            if (off < min_off || end > max_end) return false;
+        }
+
+        GLES.glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, prevElementBuffer);
+        const void* base = GLES.glMapBufferRange(GL_ELEMENT_ARRAY_BUFFER, static_cast<GLintptr>(min_off),
+                                                 static_cast<GLsizeiptr>(max_end - min_off), GL_MAP_READ_BIT);
+        if (!base) return false; // the per-sub-draw loop reports this per sub-draw
+
+        for (GLsizei i = 0; i < primcount; ++i) {
+            const GLsizei count = counts[i];
+            if (count <= 0) continue;
+            const uintptr_t off = reinterpret_cast<uintptr_t>(indices[i]);
+            const char* src = static_cast<const char*>(base) + (off - min_off);
+            const GLint bv = basevertex ? basevertex[i] : 0;
+            mg_rebase_indices_to_u32(rebased.data() + out, src, count, type, bv, restart_enabled, restart_value);
+            spans.push_back(mg_md_span_t{out, count});
+            out += static_cast<size_t>(count);
+        }
+        GLES.glUnmapBuffer(GL_ELEMENT_ARRAY_BUFFER);
+    } else {
+        for (GLsizei i = 0; i < primcount; ++i) {
+            const GLsizei count = counts[i];
+            if (count <= 0) continue;
+            if (indices[i] == nullptr) return false; // the slow loop warns and skips these
+            const GLint bv = basevertex ? basevertex[i] : 0;
+            mg_rebase_indices_to_u32(rebased.data() + out, indices[i], count, type, bv, restart_enabled, restart_value);
+            spans.push_back(mg_md_span_t{out, count});
+            out += static_cast<size_t>(count);
+        }
+    }
+
+    if (spans.empty()) return true;
+
+    if (!g_scratch_ibo) GLES.glGenBuffers(1, &g_scratch_ibo);
+    GLES.glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, g_scratch_ibo);
+    // One allocation for the whole batch rather than one per sub-draw. The
+    // rebased stream is 32-bit regardless of the source width.
+    GLES.glBufferData(GL_ELEMENT_ARRAY_BUFFER, static_cast<GLsizeiptr>(total * sizeof(GLuint)), rebased.data(),
+                      GL_STREAM_DRAW);
+    for (const mg_md_span_t& span : spans) {
+        GLES.glDrawElements(mode, span.count, GL_UNSIGNED_INT,
+                            reinterpret_cast<const void*>(span.start * sizeof(GLuint)));
+    }
+    return true;
+}
+
+// The 2.0.17 loop, kept verbatim as the fall-through for whatever the batched
+// path refuses.
+static void mg_md_bv_rebase_per_subdraw(GLenum mode, GLsizei* counts, GLenum type, const void* const* indices,
+                                        GLsizei primcount, const GLint* basevertex, GLsizei indexSize,
+                                        GLuint prevElementBuffer, bool restart_enabled, GLuint restart_value) {
+    static thread_local std::vector<GLuint> rebased;
+
+    for (GLsizei i = 0; i < primcount; ++i) {
+        const GLsizei count = counts[i];
+        if (count <= 0) continue;
+
+        const GLint bv = basevertex ? basevertex[i] : 0;
+
+        if (rebased.size() < static_cast<size_t>(count)) rebased.resize(static_cast<size_t>(count));
+
+        if (prevElementBuffer != 0) {
+            GLES.glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, prevElementBuffer);
+            void* srcData =
+                GLES.glMapBufferRange(GL_ELEMENT_ARRAY_BUFFER, static_cast<GLintptr>(reinterpret_cast<uintptr_t>(indices[i])),
+                                      static_cast<GLsizeiptr>(count) * indexSize, GL_MAP_READ_BIT);
+            if (!srcData) {
+                MD_WARN_ONCE("multidraw drawelements: element buffer is not mappable for reading, "
+                             "using driver base vertex");
+                GLES.glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, prevElementBuffer);
+                if (GLES.glDrawElementsBaseVertex) {
+                    GLES.glDrawElementsBaseVertex(mode, count, type, indices[i], bv);
+                } else if (bv == 0) {
+                    GLES.glDrawElements(mode, count, type, indices[i]);
+                } else {
+                    MD_WARN_ONCE("multidraw drawelements: cannot apply base vertex %d, sub-draw skipped", bv);
+                }
+                continue;
+            }
+            mg_rebase_indices_to_u32(rebased.data(), srcData, count, type, bv, restart_enabled, restart_value);
+            GLES.glUnmapBuffer(GL_ELEMENT_ARRAY_BUFFER);
+        } else if (indices[i] != nullptr) {
+            mg_rebase_indices_to_u32(rebased.data(), indices[i], count, type, bv, restart_enabled, restart_value);
+        } else {
+            MD_WARN_ONCE("multidraw drawelements: no element buffer bound and indices[%d] is null; "
+                         "sub-draw skipped", i);
+            continue;
+        }
+
+        GLES.glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, g_scratch_ibo);
+        GLES.glBufferData(GL_ELEMENT_ARRAY_BUFFER, static_cast<GLsizeiptr>(count) * sizeof(GLuint), rebased.data(),
+                          GL_STREAM_DRAW);
+        GLES.glDrawElements(mode, count, GL_UNSIGNED_INT, nullptr);
+    }
+}
+
 void mg_glMultiDrawElementsBaseVertex_drawelements(GLenum mode, GLsizei* counts, GLenum type,
                                                    const void* const* indices, GLsizei primcount,
                                                    const GLint* basevertex) {
@@ -773,90 +994,58 @@ void mg_glMultiDrawElementsBaseVertex_drawelements(GLenum mode, GLsizei* counts,
     const GLuint restart_value = mg_primitive_restart_index_for(type);
     // The rewritten stream carries 0xFFFFFFFF wherever a restart was, and is
     // drawn as GL_UNSIGNED_INT, so the driver's fixed-index restart has to be on
-    // for these draws. Without it 0xFFFFFFFF is fetched as vertex 4294967295 and
-    // every enabled attribute array is read out of bounds.
+    // for these draws.
     const bool force_fixed = restart_enabled && mg_enable_get(GL_PRIMITIVE_RESTART_FIXED_INDEX, 0) != GL_TRUE;
     if (force_fixed) GLES.glEnable(GL_PRIMITIVE_RESTART_FIXED_INDEX);
 
-    // Tracked rather than queried, and read before the loop below starts swapping
-    // the scratch buffer in: mg_driver_bound_buffer answers with the driver-side
-    // name, which is what every glBindBuffer here is handed.
+    // Tracked rather than queried, and read before anything here starts swapping
+    // the scratch buffer in.
     const GLuint prevElementBuffer = mg_driver_bound_buffer(GL_ELEMENT_ARRAY_BUFFER);
-
-    // One persistent scratch buffer instead of glGenBuffers/glDeleteBuffers per
-    // sub-draw.
     if (!g_scratch_ibo) GLES.glGenBuffers(1, &g_scratch_ibo);
 
-    // Grown but never shrunk, and thread_local for the same reason `staged` above
-    // is. Only the first `count` elements of any one sub-draw are written and
-    // uploaded, so what a wider sub-draw left behind is never read; sizing it to
-    // each count in turn would zero-fill a range mg_rebase_indices_to_u32
-    // overwrites in full immediately after.
-    static thread_local std::vector<GLuint> rebased;
-
-    for (GLsizei i = 0; i < primcount; ++i) {
-        const GLsizei count = counts[i];
-        if (count <= 0) continue;
-
-        const GLint bv = basevertex ? basevertex[i] : 0;
-
-        if (rebased.size() < static_cast<size_t>(count)) rebased.resize(static_cast<size_t>(count));
-
-        if (prevElementBuffer != 0) {
-            GLES.glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, prevElementBuffer);
-            void* srcData =
-                GLES.glMapBufferRange(GL_ELEMENT_ARRAY_BUFFER, static_cast<GLintptr>(reinterpret_cast<uintptr_t>(indices[i])),
-                                      static_cast<GLsizeiptr>(count) * indexSize, GL_MAP_READ_BIT);
-            if (!srcData) {
-                // An index buffer created with glBufferStorage is not readable via
-                // glMapBufferRange, and this used to drop the sub-draw silently.
-                // Let the driver apply the base vertex instead of dropping it.
-                MD_WARN_ONCE("multidraw drawelements: element buffer is not mappable for reading, "
-                             "using driver base vertex");
-                GLES.glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, prevElementBuffer);
-                if (GLES.glDrawElementsBaseVertex) {
-                    GLES.glDrawElementsBaseVertex(mode, count, type, indices[i], bv);
-                } else if (bv == 0) {
-                    // No base vertex to apply, so the unmodified stream is correct.
-                    GLES.glDrawElements(mode, count, type, indices[i]);
-                } else {
-                    // The offset cannot be applied without either a readback or
-                    // driver support. Skipping the sub-draw loses geometry, but
-                    // drawing it would place it at the wrong vertices, and wrong
-                    // geometry is worse than missing geometry.
-                    MD_WARN_ONCE("multidraw drawelements: cannot apply base vertex %d, sub-draw skipped", bv);
-                }
-                continue;
+    // Does any sub-draw actually move? basevertex 0 everywhere and no sentinel
+    // to substitute means the stream the application already uploaded is exactly
+    // the stream that has to be drawn, and every byte of the 2.0.17 rebase --
+    // the readback, the widening to 32 bits, the upload -- was pure overhead.
+    bool needs_rebase = mg_restart_needs_rewrite(type);
+    if (!needs_rebase && basevertex != nullptr) {
+        for (GLsizei i = 0; i < primcount; ++i) {
+            if (basevertex[i] != 0) {
+                needs_rebase = true;
+                break;
             }
-            mg_rebase_indices_to_u32(rebased.data(), srcData, count, type, bv, restart_enabled, restart_value);
-            GLES.glUnmapBuffer(GL_ELEMENT_ARRAY_BUFFER);
-        } else if (indices[i] != nullptr) {
-            mg_rebase_indices_to_u32(rebased.data(), indices[i], count, type, bv, restart_enabled, restart_value);
-        } else {
-            // No element buffer bound and a null client pointer: there is nothing
-            // to read. GL leaves this undefined, and reading it is a segfault at
-            // address zero rather than a wrong picture -- which is what it was,
-            // reachable from the in-process benchmark the moment borrowing ANGLE
-            // started working, because a sub-draw's `indices` there is a buffer
-            // offset and offset zero is a null pointer.
-            //
-            // The binding is what decides which of the two `indices` means, so a
-            // zero binding with offset-shaped indices is a caller-side mistake
-            // this cannot repair. Say so once and skip: missing geometry beats a
-            // crash, and beats reading whatever happens to be at address zero.
-            MD_WARN_ONCE("multidraw drawelements: no element buffer bound and indices[%d] is null; "
-                         "sub-draw skipped",
-                         i);
-            continue;
         }
-
-        GLES.glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, g_scratch_ibo);
-        GLES.glBufferData(GL_ELEMENT_ARRAY_BUFFER, static_cast<GLsizeiptr>(count) * sizeof(GLuint), rebased.data(),
-                          GL_STREAM_DRAW);
-        // The rebased stream is 32-bit regardless of the source width.
-        GLES.glDrawElements(mode, count, GL_UNSIGNED_INT, nullptr);
     }
 
+    if (!needs_rebase) {
+        for (GLsizei i = 0; i < primcount; ++i) {
+            const GLsizei count = counts[i];
+            if (count <= 0) continue;
+            if (prevElementBuffer == 0 && indices[i] == nullptr) {
+                MD_WARN_ONCE("multidraw drawelements: no element buffer bound and indices[%d] is null; "
+                             "sub-draw skipped", i);
+                continue;
+            }
+            GLES.glDrawElements(mode, count, type, indices[i]);
+        }
+        mg_md_perf_account(primcount, 0);
+        if (force_fixed) GLES.glDisable(GL_PRIMITIVE_RESTART_FIXED_INDEX);
+        CHECK_GL_ERROR
+        return;
+    }
+
+    if (mg_md_bv_rebase_batched(mode, counts, type, indices, primcount, basevertex, indexSize, prevElementBuffer,
+                                restart_enabled, restart_value)) {
+        mg_md_perf_account(primcount, 1);
+        if (force_fixed) GLES.glDisable(GL_PRIMITIVE_RESTART_FIXED_INDEX);
+        GLES.glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, prevElementBuffer);
+        CHECK_GL_ERROR
+        return;
+    }
+
+    mg_md_bv_rebase_per_subdraw(mode, counts, type, indices, primcount, basevertex, indexSize, prevElementBuffer,
+                                restart_enabled, restart_value);
+    mg_md_perf_account(primcount, primcount > 0 ? static_cast<int>(primcount) : 0);
     if (force_fixed) GLES.glDisable(GL_PRIMITIVE_RESTART_FIXED_INDEX);
     GLES.glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, prevElementBuffer);
 

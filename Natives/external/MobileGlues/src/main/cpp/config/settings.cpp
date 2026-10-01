@@ -28,6 +28,15 @@ void init_settings() {
     global_settings.angle_depth_clear_fix_mode = AngleDepthClearFixMode::Disabled;
     global_settings.fsr1_setting = FSR1_Quality_Preset::Disabled;
     global_settings.hide_mg_env_level = HideMGEnvLevel::Disabled;
+    // Task178 (Amethyst fork): the Android branch below sets
+    // buffer_coherent_as_flush = (angle == Disabled) right after the ANGLE
+    // switch, but the Apple branch never assigned it at all. global_settings
+    // is a zero-initialised static, so iOS shipped with it stuck at false
+    // while every Android session -- where ANGLE is also Disabled -- ran with
+    // true. Mirror the Android value here: on iOS ANGLE is unconditionally
+    // Disabled (set above), which is exactly the condition Android resolves
+    // to true for.
+    global_settings.buffer_coherent_as_flush = true;
 
     // Load config.json for iOS-relevant settings (customGLVersion, cache size, etc.)
     int success = initialized;

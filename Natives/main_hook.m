@@ -6,8 +6,15 @@
 #import "mach_excServer.h"
 
 #include <dlfcn.h>
+#include <execinfo.h>
+#include <fcntl.h>
 #include <libgen.h>
 #include <pthread.h>
+#include <stdatomic.h>
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
+#include <unistd.h>
 #include "external/fishhook/fishhook.h"
 
 // 硬件断点异常端口（同步自上游，用于非 TXM 的 iOS 26+ 设备 dlopen 重定向）
@@ -18,6 +25,18 @@ void (*orig_abort)();
 void (*orig_exit)(int code);
 void* (*orig_dlopen)(const char* path, int mode);
 void* (*orig_dlsym)(void* handle, const char* name);
+
+// Task 144：headless JVM（Forge/NeoForge 直装的 processors）执行期 exit 抑制。
+// 病历（装机 latestlog 20:42 会话，9aa15c8 构建）：Forge 处理器全部跑完、
+// 进度 0.85 时，安装器 JVM 的 libjli 内部线程调用 exit(0) 结束自身 ——
+// 但 JVM 与启动器同进程，整个 app 被带走（用户视角"forge安装闪退"，
+// modpack 安装在 85% 处中断）。ForgeProcessorExecutor 在 launchHeadlessJVM
+// 前后置位/清零本标志；hooked_exit 命中标志时改为 pthread_exit 仅终结
+// 调用线程（JVM 自身线程），ObjC 侧继续读 status.json 判定成败。
+// 游戏正常退出路径（标志未置位）不受影响。
+atomic_int g_ame_suppressJvmExit = 0;
+// Task 146：headless JVM 终结信号（语义与置位点见 JavaLauncher.h 注释）。
+atomic_int g_ame_headlessJvmFinished = 0;
 
 // MARK: - SDL3 grab 状态同步（MC 26.3）
 //
@@ -34,19 +53,34 @@ extern void CallbackBridge_syncGrabStateFromSDL(BOOL relMode, const char *source
 // dlsym 层拦截。返回非 NULL 表示该符号被兼容层接管。
 extern void *amethyst_sdl3_hook_resolve(void *handle, const char *name);
 
-// MARK: - shaderc include 展开（MC 26.3 renderpearl）
-//
-// 26.3 的 `#include <minecraft:...>` 由 libshaderc.dylib 的 shim 层在编译入口
-// 做文本级展开（Natives/shaderc_shim.c Task 47 + Natives/shaderc_include.c），
-// 与参考仓库一致。
-//
-// 另：shaderc_compile_into_* 三个【编译入口】由本文件 hooked_dlsym 接管并 hop 到
-// 32MB 栈线程，与参考仓库一致（下方 MARK）。此前本仓库只接管了 spvc 两个入口，
-// 依据参考仓库真机记录（hs_err_pid27946 等）：MC 26.3 正式版走 RenderPearl 的
-// shaderc 编译路径，glslang 深递归在 JVM 1MB 栈上 SIGSEGV；而 snapshot-10 不走
-// 该路径（"dlsym 拦截日志只证明符号被解析，不代表函数被调用"），故此前未暴露。
-// 编译入口的 32MB hop 不持任何跨库锁（生命周期入口的串行化仍由
-// shaderc_shim.c / spvc_shim.c 负责），不会重现 master compile lock 死锁。
+// Task 132：hooked_dlopen 的 libjnidispatch _dlsym 槽位重绑定需要
+// hooked_dlsym 的地址；其定义在本文件后部（JVM hook 区），此处前向声明
+// （CI 35512461717 教训：415 行引用点先于定义点，缺声明即 undeclared）。
+void *hooked_dlsym(void *handle, const char *name);
+
+// Task 133：JVM 侧 dlopen 链重绑定（sdl3_hook.m）——libjli/libjvm 的
+// _dlopen 槽改绑到 hooked_dlopen（此后 JVM 的一切 System.load 都可见），
+// libjnidispatch（含 jna*.tmp 解包形态，按 install name 识别）的 _dlsym
+// 槽改绑到 hooked_dlsym（Task131 守卫对 JNA 路径生效）。由本文件的
+// hooked_dlopen（JVM/JNA 相关路径加载后）与 hooked_dlsym（入口）驱动。
+void amethyst_task133_ensure_jvm_chain(void);
+
+// Task 132/133 构建修复桩：b9b31590b 只移植了调用点与注释，
+// amethyst_task132_rebind_jna_dlsym 与 amethyst_task133_ensure_jvm_chain
+// 的真实实现从未进仓库（sdl3_hook.m 内无此二函数），导致 C99 隐式声明
+// error 整停 native 编译。此处以 no-op 桩恢复构建，行为等同此前所有
+// 成功构建（重绑定从未执行过）；hooked_dlsym 热路径调用的 133 桩保持
+// 零开销（不打日志，避免高频刷屏）。
+// TODO(port): 从 Air-Minecraft-iOS-Launcher 的 sdl3_hook.m 移植二者完整
+// 实现时，删除下方桩函数（留声明），否则链接期 duplicate symbol。
+void amethyst_task132_rebind_jna_dlsym(void *handle, void *hook) {
+    (void)handle; (void)hook;
+    NSLog(@"[Task132] stub: JNA dlsym rebind not yet ported, skipping");
+}
+
+void amethyst_task133_ensure_jvm_chain(void) {
+    // no-op 桩，见上方说明。
+}
 
 static bool (*g_real_SDL_SetWindowRelativeMouseMode)(void *window, bool enabled) = NULL;
 
@@ -87,6 +121,12 @@ static bool amethyst_SDL_SetWindowMouseGrab(void *window, bool grabbed) {
 // "OpenGL library already loaded"。于是 MC 判定 OpenGL 不可用，回落到原生
 // Vulkan（MoltenVK），MobileGL / MobileGlues 这类 GL 转译渲染器完全失效，
 // 最终撞上 RenderPearl 的 shaderc/glslang 路径而崩溃。
+//
+// Task 79 注：本包装器现在只是【兜底】——sdl3_hook.m 的 EGL bridge
+// （ame_glBridgeEnabled，Task 79 起 zink 也包含在内）在 hooked_dlsym 里
+// 优先接管 SDL_GL_LoadLibrary，真实 SDL 从不被调用。仅当 bridge 被禁用
+// （AMETHYST_SDL_GL_BRIDGE=0 / AMETHYST_ZINK_GL_BRIDGE=0 诊断模式）时，
+// MC 才会落到这里，走"真实 SDL 拒载 + 兑装成功"的旧路径。
 //
 // 该错误其实意味着"库已装载且正是我们选中的渲染器"，故视为成功；
 // 其它错误（找不到库等）仍如实返回失败。
@@ -157,6 +197,79 @@ void *amethyst_orig_dlsym(void *handle, const char *name) {
 // 但 hooked_dlopen 在文件前部就需要引用它来检测 libOSMesa 加载）
 static BOOL g_zinkStrideFixActive = NO;
 
+// MARK: - fatal 通道取证（Task 27，26.3-pre-1 第四关）
+//
+// 背景：游戏死亡时 PLCrashView 弹出（= hooked_exit/hooked_abort 被某个非主线程
+// 触发），但设备上既无 .ips 也无 hs_err：
+//   - hooked_abort/hooked_exit 会 park 调用线程，orig_abort/orig_exit 永不执行，
+//     所以 iOS 崩溃报告器永远收不到真实信号 -> .ips 必然不会生成（这是拦截
+//     机制的固有属性，不是系统没记录）；
+//   - 若死亡源自 JVM 的 SIGSEGV fatal handler，hs_err 文本只写进 stdout/stderr
+//     管道，而 latestlog 尾部在多行突发 + 死亡竞争中会丢（Task 26：截断+NUL 空洞）。
+// 因此取证改为绕过管道：O_APPEND 直写 $POJAV_HOME/fatal_trace.txt（malloc-free，
+// 防 heap 损坏场景下的递归 abort），再 NSLog 到系统日志兜底（Console 可回捞）。
+// 下一轮测试的 fatal_trace.txt 就是“谁调用了 abort/exit”的定位铁证。
+void ame_write_fatal_trace(const char *reason) {
+    // 防重入：若 abort 源于 heap 损坏，本函数内的任何分配都可能再次 abort。
+    // 全程不用 malloc（静态缓冲 + snprintf），并用 CAS 拒绝并发/递归进入。
+    static atomic_int busy;
+    int expected = 0;
+    if (!atomic_compare_exchange_strong(&busy, &expected, 1)) {
+        return;
+    }
+
+    static char report[16384];
+    size_t len = 0;
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    struct tm tmv;
+    localtime_r(&ts.tv_sec, &tmv);
+    len += (size_t)snprintf(report + len, sizeof(report) - len,
+        "\n===== [Amethyst fatal trace] %04d-%02d-%02d %02d:%02d:%02d.%03d =====\n",
+        tmv.tm_year + 1900, tmv.tm_mon + 1, tmv.tm_mday,
+        tmv.tm_hour, tmv.tm_min, tmv.tm_sec, (int)(ts.tv_nsec / 1000000));
+
+    char tname[64] = {0};
+    pthread_getname_np(pthread_self(), tname, sizeof(tname));
+    len += (size_t)snprintf(report + len, sizeof(report) - len,
+        "reason: %s\nthread: %s\n",
+        reason ? reason : "(null)", tname[0] ? tname : "(unnamed)");
+
+    void *frames[64];
+    int n = backtrace(frames, 64);
+    for (int i = 0; i < n && len < sizeof(report) - 256; i++) {
+        Dl_info info;
+        memset(&info, 0, sizeof(info));
+        if (dladdr(frames[i], &info) && info.dli_fname) {
+            len += (size_t)snprintf(report + len, sizeof(report) - len,
+                "  #%02d %p  %s  %s + %llu\n", i, frames[i],
+                info.dli_fname,
+                info.dli_sname ? info.dli_sname : "?",
+                (unsigned long long)((uintptr_t)frames[i] - (uintptr_t)info.dli_fbase));
+        } else {
+            len += (size_t)snprintf(report + len, sizeof(report) - len,
+                "  #%02d %p\n", i, frames[i]);
+        }
+    }
+
+    // 先落盘（不经管道/stdio，O_APPEND 单次 write），后 NSLog（系统日志兑底）
+    const char *home = getenv("POJAV_HOME");
+    if (home) {
+        char path[1024];
+        snprintf(path, sizeof(path), "%s/fatal_trace.txt", home);
+        int fd = open(path, O_WRONLY | O_CREAT | O_APPEND, 0644);
+        if (fd >= 0) {
+            ssize_t wr = write(fd, report, len);
+            (void)wr;
+            close(fd);
+        }
+    }
+    if (len < sizeof(report)) report[len] = '\0';
+    NSLog(@"%s", report);
+
+    atomic_store(&busy, 0);
+}
+
 void handle_fatal_exit(int code) {
     if (NSThread.isMainThread) {
         return;
@@ -178,22 +291,69 @@ void handle_fatal_exit(int code) {
 
 void hooked_abort() {
     NSLog(@"abort() called");
+    ame_write_fatal_trace("abort() called");
     handle_fatal_exit(SIGABRT);
     orig_abort();
 }
 
 void hooked___assert_rtn(const char* func, const char* file, int line, const char* failedexpr)
 {
+    // 断言消息也直写 fatal_trace：stderr 管道尾部在死亡竞争中不可靠（Task 26）
+    char assertMsg[1024];
     if (func == NULL) {
         fprintf(stderr, "Assertion failed: (%s), file %s, line %d.\n", failedexpr, file, line);
+        snprintf(assertMsg, sizeof(assertMsg), "assertion failed: (%s), file %s, line %d",
+                 failedexpr ? failedexpr : "?", file ? file : "?", line);
     } else {
         fprintf(stderr, "Assertion failed: (%s), function %s, file %s, line %d.\n", failedexpr, func, file, line);
+        snprintf(assertMsg, sizeof(assertMsg), "assertion failed: (%s), function %s, file %s, line %d",
+                 failedexpr ? failedexpr : "?", func ? func : "?", file ? file : "?", line);
     }
+    ame_write_fatal_trace(assertMsg);
     hooked_abort();
 }
 
 void hooked_exit(int code) {
+    // Task 32 黑屏取证：exit 时刻的呈现路径快照。
+    // MC 26.3 设备实测黑屏约 20 秒后干净退出（exit(0)）—— 退出时渲染循环
+    // 是否还在交换帧、呈现路径是否健康，是判定"黑屏 = 渲染停了"还是
+    // "黑屏 = 帧没上屏"的最后一块拼图（计数器由 gl_bridge.m 维护）。
+    {
+        unsigned long swapOK = 0, swapFail = 0;
+        ame_egl_swap_stats(&swapOK, &swapFail);
+        NSLog(@"[RenderDiag] exit(%d) snapshot: swapOK=%lu swapFail=%lu", code, swapOK, swapFail);
+    }
     NSLog(@"exit(%d) called", code);
+    // Task 144：headless JVM 执行期的 exit 抑制（Forge 安装"闪退"根治）。
+    // 命中标志时：仅终结调用线程（libjli/JVM 内部线程），进程存活，
+    // launchHeadlessJVM 的调用方继续读 status.json 判定安装成败。
+    // 主线程豁免：主线程上若有极端路径 exit，走原逻辑（不能 pthread_exit
+    // 主线程把 app 挂死）。
+    if (atomic_load(&g_ame_suppressJvmExit) && !pthread_main_np()) {
+        char supMsg[96];
+        snprintf(supMsg, sizeof(supMsg), "Task144: exit(%d) suppressed during headless JVM (thread exits, process lives)", code);
+        NSLog(@"[Amethyst] %s", supMsg);
+        ame_write_fatal_trace(supMsg);
+        // Task 146：exit 被拦截 = 安装器 JVM 已跑完（libjli 的 exit(0) 就是
+        // 它的"正常收尾"）。先置终结信号再 pthread_exit，等待方据此继续
+        // 读 status.json 判定安装成败（不再依赖 join —— libjli 的终止设计
+        // 就是杀进程，JLI_Launch 永远不会返回，装机日志 0.85 (4/4) 刷屏实锤）。
+        atomic_store(&g_ame_headlessJvmFinished, 1);
+        pthread_exit(NULL);
+    }
+    // Task 48：exit(0) 也写回溯。此前只有非零退出才落 fatal_trace.txt；而
+    // 实测黑屏约 20 秒后的静默 exit(0)（渲染循环仍在交换）来源不明——
+    // MC 窗口可见性看门狗 / JVM 主线程 / 启动器超时都有可能。回溯写入
+    // $POJAV_HOME/fatal_trace.txt（O_APPEND、malloc-free），下轮日志即可
+    // 一锤定音定位调用者。code==0 的回溯不弹崩溃界面、不影响正常退出。
+    if (code == 0) {
+        ame_write_fatal_trace("exit(0) backtrace (Task 48, black-screen-era silent exit)");
+    }
+    if (code != 0) {
+        char exitMsg[64];
+        snprintf(exitMsg, sizeof(exitMsg), "exit(%d) called", code);
+        ame_write_fatal_trace(exitMsg);
+    }
     if (code == 0) {
         dispatch_async(dispatch_get_main_queue(), ^{
             [UIApplication.sharedApplication performSelector:@selector(suspend)];
@@ -208,6 +368,39 @@ void hooked_exit(int code) {
 }
 
 void* hooked_dlopen(const char* path, int mode) {
+    // ------------------------------------------------------------------
+    // Task 106（BMC2 创建存档闪退根治）：拦截 spark 的原生分析器。
+    //
+    // 41cdff0 装机日志（2e1ea09 构建）：BMC2 1.20.1 首次走到"创建新世界"，
+    // server 线程 bootstrap 到 spark 的 "Starting background profiler..."，
+    // spark 把 jar 内置的 spark/macos/libasyncProfiler.so（FAT: x86_64+arm64，
+    // arm64 切片带 20960 字节 LC_CODE_SIGNATURE，platform=macOS）解包到
+    // config/spark/tmp/spark-*.tmp 并 System.load——这是本设备历史上第一个
+    // 走进 PLPatchMachOPlatformForFile 重标签路径的库（此前所有会话 0 次）。
+    // 平台重标签改写了 mach header → 签名哈希不再匹配 → dyld 代码签名校验
+    // 失败 → 进程被杀（SIGKILL，无 hs_err 无 fatal trace——日志最后一行
+    // 正是 "[Amethyst] Patching ...libasyncProfiler.so.tmp"）。
+    // 未签名库（本设备其余全部 home 目录库）重标签无害；已签名库重标签
+    // 必死。spark 的 Java 侧对 UnsatisfiedLinkError 有完整降级（1.10.53
+    // 字节码实证：AsyncProfilerAccess.load catch UnsatisfiedLinkError →
+    // NativeLoadingException → getInstance catch Exception → 分析器禁用，
+    // 游戏继续），拦截是零风险选择：spark 回退 Java 采样器，建档照常进行。
+    //
+    // Task107 修正（dyld_patch_platform.m 已改签名中和为 ad-hoc 重签名）：
+    // 上述"未签名库重标签无害"的表述经 ce43a34 双会话证伪——本机 dyld4
+    // 对"无签名 blob"的库一律拒载（JNA libjnidispatch 报 "missing code
+    // signature"，26.3 因此崩在 MacosUtil→JNA 链）；历史能加载的库其实
+    // 全部至少带 ad-hoc/linker 签名（哈希失效被容忍）。重签名后该拦截仅
+    // 防御"team 签名 FAT 库无法原位重签"的残余场景 + 不让 macOS 分析器
+    // 真的跑在 iOS 上，保留。
+    if (path != NULL && strstr(path, "libasyncProfiler") != NULL) {
+        static int s_ame106_blocked = 0;
+        if (s_ame106_blocked < 3) {
+            ++s_ame106_blocked;
+            NSLog(@"[Amethyst] Task106: blocked dlopen of signed macOS profiler lib (%s) -- platform retag would invalidate its code signature and dyld would kill the process; spark falls back to its Java sampler (world creation proceeds)", path);
+        }
+        return NULL;
+    }
     // 同步自上游：非 TXM 的 iOS 26+ 设备需要硬件断点重定向（hooked_dlopen_26_ppl）
     BOOL shouldUseDyldBypass26PPL = NO;
     if (DeviceHasJITFlags(JIT_FLAG_FORCE_MIRRORED)) {
@@ -233,10 +426,31 @@ void* hooked_dlopen(const char* path, int mode) {
     // （installZinkStrideFix 在 libOSMesa 加载前调用，初次 rebind 无法
     //  捕获 libOSMesa image 内的引用；必须在其加载后再次 rebind）
     BOOL needsZinkRebind = path && strstr(path, "libOSMesa") && g_zinkStrideFixActive;
+    // Task 132（26.1.2 整合包 controlify/JNA closure SIGBUS 补完）：
+    // libjnidispatch（JNA 原生库）加载后重绑定其 _dlsym 指针槽为
+    // hooked_dlsym——否则 JNA 经自己的 GOT 槽调真 dlsym，Task131 的
+    // SDL_SetEventFilter/SDL_AddEventWatch 守卫对 JNA 路径不生效
+    // （机制与实现见 sdl3_hook.m 的 Task 132 块）。
+    // 注：JNA 5.13 从 jar 解包到临时文件（jna<随机>.tmp），路径里没有
+    // "libjnidispatch" 字样——单靠这个 strstr 永远不会命中（b33e550/
+    // 3bcf8c4 装机日志实证零 Task132 日志行）；真正的检测在 Task133 的
+    // install-name 扫描里，此处保留作为显式命名加载形态的直通路径。
+    BOOL needsJnaDlsymRebind = path != NULL && strstr(path, "libjnidispatch") != NULL;
+    // Task 133：JVM/JNA 链路加载后跑镜像扫描——libjli/libjvm 的 _dlopen
+    // 槽改绑（JVM 后续 System.load 全部进入本 hook），jna*.tmp 按
+    // install name 检出并触发 Task132 重绑定。触发面：libjli/libjvm/
+    // jna/.tmp/java 路径；漏网的由 hooked_dlsym 入口的同款扫描兜底。
+    BOOL needsT133Scan = path != NULL && (strstr(path, "libjli") != NULL ||
+                                          strstr(path, "libjvm") != NULL ||
+                                          strstr(path, "jna") != NULL ||
+                                          strstr(path, ".tmp") != NULL ||
+                                          strstr(path, "java") != NULL);
+    // Task 132/133 同样需要拿到真实句柄做后处理，与 zink 重绑同款非尾返路径
+    BOOL needsPostLoadFixup = needsZinkRebind || needsJnaDlsymRebind || needsT133Scan;
 
     void *handle;
     if (shouldUseDyldBypass26PPL) {
-        if (needsZinkRebind) {
+        if (needsPostLoadFixup) {
             handle = hooked_dlopen_26_ppl(path, mode);
         } else {
             __attribute__((musttail)) return hooked_dlopen_26_ppl(path, mode);
@@ -246,13 +460,13 @@ void* hooked_dlopen(const char* path, int mode) {
         // which will break this dyld bypass, so we redirect calls to the original dlopen.
         static void *(*sys_dlopen)(const char *, int);
         if(!sys_dlopen) sys_dlopen = dlsym(RTLD_NEXT, "dlopen");
-        if (needsZinkRebind) {
+        if (needsPostLoadFixup) {
             handle = sys_dlopen(path, mode);
         } else {
             __attribute__((musttail)) return sys_dlopen(path, mode);
         }
     } else {
-        if (needsZinkRebind) {
+        if (needsPostLoadFixup) {
             handle = orig_dlopen(path, mode);
         } else {
             __attribute__((musttail)) return orig_dlopen(path, mode);
@@ -263,6 +477,18 @@ void* hooked_dlopen(const char* path, int mode) {
     if (handle && needsZinkRebind) {
         NSLog(@"[ZinkStrideFix] libOSMesa loaded via dlopen, re-rebinding Vulkan symbols");
         rebindZinkStrideFixForNewImage();
+    }
+    // Task 132：libjnidispatch 的 _dlsym 槽位重绑定（实现待移植，当前为本文件桩）。
+    // 幂等（重复加载安全）；失败仅记日志不阻断加载。
+    if (handle && needsJnaDlsymRebind) {
+        amethyst_task132_rebind_jna_dlsym(handle, (void *)hooked_dlsym);
+    }
+    // Task 133：镜像扫描（增量，无新镜像时一次计数调用即早退）——
+    // libjli/libjvm 的 _dlopen 槽改绑 + libjnidispatch（任意文件名形态）
+    // 的 _dlsym 槽改绑。加载失败（handle==NULL）也扫：镜像可能已部分
+    // 注册或由其它线程并发加载完成，扫描本身幂等。
+    if (needsT133Scan) {
+        amethyst_task133_ensure_jvm_chain();
     }
     return handle;
 }
@@ -1213,11 +1439,10 @@ void rebindZinkStrideFixForNewImage(void) {
 ///   - vkGetInstanceProcAddr → 返回 amethyst_vkGetInstanceProcAddr
 ///     （拦截 vkCreateGraphicsPipelines 调用，强制 stride 4 字节对齐）
 ///   - vkGetDeviceProcAddr → 返回 amethyst_vkGetDeviceProcAddr
-///     （拦截 vkCmd* / vkDestroyPipeline 调用，跟踪 dummy pipeline）
+///     （跟踪 dummy pipeline）
 ///
 /// 其他函数正常返回 orig_dlsym 的结果，避免日志爆炸。
 
-// ============================================================================
 // MARK: - shaderc 编译重定向到 32MB 栈线程（MC 26.3 RenderPearl）
 //
 // MC 26.3 起 RenderPearl 用 LWJGL 的 shaderc 绑定在游戏线程上直接编译 GLSL
@@ -1512,6 +1737,12 @@ static int amethyst_spvc_compiler_compile(void *compiler, const char **source) {
 }
 
 void* hooked_dlsym(void* handle, const char* name) {
+    // Task 133：入口镜像扫描（兜底触发面）——即使 dlopen 链因意外形态
+    // 失守（如 JVM 库换了名字/路径），启动器自身的高频 dlsym（egl_bridge/
+    // gl_bridge/initSDLEventFuncs 等符号解析）也会在 controlify 初始化
+    // 之前把已加载的 libjli/libjvm/libjnidispatch 绑进 hook。增量游标，
+    // 无新镜像时开销 = 一次 dyld 计数调用。
+    amethyst_task133_ensure_jvm_chain();
     // SDL3 兼容层：建窗前强制 ES profile、主窗口复用、EGL 兼容重试、
     // Vulkan loader 句柄共享。返回非 NULL 表示已接管该符号。
     {

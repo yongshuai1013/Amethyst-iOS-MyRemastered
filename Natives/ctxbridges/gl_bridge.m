@@ -748,15 +748,36 @@ static void ame_task41_swap_forensics(EGLSurface surface, unsigned long swapInde
     // viewport 双维严格小于 surface：转置形态（一维大一维小，如 820x1180 vs
     // 1180x820）不满足 → 真正的几何事故仍会走自愈链。FSR 关闭或非 MG
     // 渲染器时 viewport==surface，豁免天然无操作。
-    static int s_task78_fsr_link = -1;
-    if (s_task78_fsr_link < 0) {
+    // 启动器侧 FSR1（video.fsr1，见 Natives/fsr1/ame_fsr1.m）与 MG 内置 FSR1
+    // 在几何上是同一种形态：surface 保持全分辨率、MC 按低分辨率绘制，画面落
+    // 在 surface 一角再由 FSR1 上采样铺满。若不把它纳入豁免，本函数就会把这
+    // 个「按设计存在的失配」判成几何事故，Task49 geo-heal / Task55 realign
+    // 会试图把 surface 拉回 viewport 尺寸，而 transposed 标志恒为真又会挡住
+    // SurfaceViewController 对 drawableSize 的写入 —— 全分辨率 backbuffer 被
+    // 塞进低分辨率 drawable 再上屏，表现正是「画面跑到左下角、被放大且超出
+    // 屏幕」。真正的几何事故（转置：一维大一维小）不满足下方的双维严格小于
+    // 条件，仍会走自愈链；100% 分辨率下 viewport==surface，豁免天然无操作。
+    // 每帧重算而非缓存：设置页可以在运行中改开关/分辨率并重建 surface，
+    // 缓存会让豁免在 FSR1 已开启后仍停在关闭态。两个 getenv + 一次偏好读取
+    // 每帧一次，开销可忽略（日志仍只打一次）。
+    int s_task78_fsr_link = 0;
+    {
         const char *ame78_renderer = getenv("AMETHYST_RENDERER");
         NSInteger ame78_fsr = getPrefInt(@"mobileglues.fsr1_setting");
-        s_task78_fsr_link = (ame78_renderer != NULL &&
-                             strcmp(ame78_renderer, RENDERER_NAME_MOBILEGLUES) == 0 &&
-                             ame78_fsr > 0) ? 1 : 0;
-        if (s_task78_fsr_link) {
-            NSLog(@"[GLGeo] Task78 FSR linkage active: renderer=MobileGlues fsr1_setting=%ld -- viewport (render) < surface is the expected upscale geometry, compensation chain exempted", (long)ame78_fsr);
+        BOOL ame78_on = getPrefBool(@"video.fsr1");
+        const char *ame78_env = getenv("AMETHYST_FSR1");
+        if (ame78_env != NULL) {
+            if (strcmp(ame78_env, "0") == 0) ame78_on = NO;
+            else if (strcmp(ame78_env, "1") == 0) ame78_on = YES;
+        }
+        const BOOL ame78_mg = (ame78_renderer != NULL &&
+                               strcmp(ame78_renderer, RENDERER_NAME_MOBILEGLUES) == 0 &&
+                               ame78_fsr > 0);
+        s_task78_fsr_link = (ame78_mg || ame78_on) ? 1 : 0;
+        static BOOL s_task78_link_logged = NO;
+        if (s_task78_fsr_link && !s_task78_link_logged) {
+            s_task78_link_logged = YES;
+            NSLog(@"[GLGeo] Task78 FSR linkage active: mg_fsr1_setting=%ld launcher_fsr1=%d -- viewport (render) < surface is the expected upscale geometry, compensation chain exempted", (long)ame78_fsr, (int)ame78_on);
         }
     }
     const BOOL geoMismatch = (viewport[2] > 0 && viewport[3] > 0 &&
@@ -1226,6 +1247,112 @@ static PFNEGLDESTROYCONTEXTPROC    ame_raw_destroy_context = NULL;
 static PFNEGLDESTROYSURFACEPROC    ame_raw_destroy_surface = NULL;
 static PFNEGLSWAPINTERVALPROC      ame_raw_swap_interval = NULL;   // Task 76 双保险
 
+// ============================================================================
+// [sfpew-egl-route] SFPEW 叠加时的 EGL 解析路由（可 A/B）
+//
+// 符号表事实（vendored SimpleFPEWrapper 全目录核对，不会说谎）：
+//   SFPEW 只导出 7 个 EGL 符号 —— eglGetProcAddress / eglCreateContext /
+//   eglDestroyContext / eglMakeCurrent / eglSwapBuffers /
+//   eglSwapBuffersWithDamageEXT / eglSwapBuffersWithDamageKHR。
+//   eglGetDisplay / eglInitialize / eglChooseConfig / eglBindAPI /
+//   eglCreateWindowSurface 一律不导出。
+//
+// 因此宿主有两种接法，且只有一种成立：
+//   (a) dlsym(SFPEW) 取全部 EGL      -> infra 全部 NULL，必然崩（19ef078d 之前）
+//   (b) dlsym(真后端) 取全部 EGL      -> SFPEW 的 lifecycle 一次都不被调用，
+//       sfpewRegisterContextDispatch / sfpewNoteDispatchCurrentContext 从不登记，
+//       dispatch registry 恒空 -> "No context is current"（19ef078d，当前默认）
+//   (c) 用 SFPEW 的 eglGetProcAddress 解析全部 EGL —— 安卓/FCL 实测模型。
+//       lookup.cpp 里它自动分流：create/destroy/makeCurrent/swap 返回 SFPEW
+//       包装版，其余名字转发后端 g_eglFuncs.eglGetProcAddress。
+//       FCL 三份实测日志（SFPEW+MG、SFPEW+MobileGL 1.7.10 与 1.12.2）
+//       POJAVEXEC_EGL=libSimpleFPEWrapper.so 正是这条路径，两个组合都正常。
+//
+// (c) 需要 SFPEW 先 dlopen 后端（SFPEW_EGL，JavaLauncher 已设置）成功。
+// 默认关闭（保持现状），设 AMETHYST_SFPEW_EGL_ROUTE=1 启用，无需重新构建。
+// ============================================================================
+static BOOL ame_sfpew_egl_route_active = NO;
+
+// Task 179：默认启用。
+//
+// 根因（SFPEW lookup.cpp:75-79 的注释，原文）：
+//   "the wrapper has to drain its pending batch before the frame is presented,
+//    or geometry drawn late in the frame is submitted into the next one and
+//    cleared away."
+// 即 eglSwapBuffers 必须经 SFPEW 的 wrapper：wrapper 要在 present 前把延迟
+// 提交的几何冲出去。模型 (b)（全部 EGL 从真后端 dlsym）绕过了它，于是
+// SFPEW 的 pending batch 从不 drain，每帧几何被推到下一帧再被 clear ——
+// 这正是 MobileGL-gles + SFPEW 加载界面白屏、ANGLE/LTW + SFPEW 全黑的成因。
+//
+// FCL 实测三份日志 POJAVEXEC_EGL=libSimpleFPEWrapper.so，EGL 入口就是 SFPEW
+// 本身，等价于此处的 (c)：lifecycle（create/destroy/makeCurrent/swap）走
+// SFPEW wrapper，infra 由 SFPEW 转发后端（lookup.cpp:1048-1055）。
+//
+// 保留 opt-out：AMETHYST_SFPEW_EGL_ROUTE=0 回到模型 (b)。解析失败同样回落。
+static BOOL ameSFPEWEglRouteWanted(void) {
+    const char *v = getenv("AMETHYST_SFPEW_EGL_ROUTE");
+    if (v == NULL) return YES;                    // 默认启用
+    return !(strcmp(v, "0") == 0);
+}
+
+static BOOL ameSFPEWResolveEGL(void) {
+    void *sfpew = dlopen("@rpath/libSimpleFPEWrapper.dylib", RTLD_NOW | RTLD_GLOBAL);
+    if (!sfpew) sfpew = dlopen("libSimpleFPEWrapper.dylib", RTLD_NOW | RTLD_GLOBAL);
+    if (!sfpew) {
+        NSLog(@"[SFPEW-EGL] dlopen libSimpleFPEWrapper.dylib failed: %s", dlerror() ?: "unknown");
+        return NO;
+    }
+    void *raw = dlsym(sfpew, "eglGetProcAddress");
+    if (!raw) {
+        NSLog(@"[SFPEW-EGL] eglGetProcAddress not exported by SFPEW");
+        return NO;
+    }
+    void *(*gpa)(const char *) = NULL;
+    // void* -> 函数指针：经由 union 避免 ISO C 的客体/函数指针混用告警
+    union { void *obj; void *(*fn)(const char *); } cast;
+    cast.obj = raw;
+    gpa = cast.fn;
+
+#define AME_SFPEW_EGL(field, name)                                                  \
+    do {                                                                            \
+        void *fn = gpa(name);                                                       \
+        if (fn != NULL) { handle.field = (__typeof__(handle.field))fn; }            \
+        else NSLog(@"[SFPEW-EGL] " name " unresolved via eglGetProcAddress");        \
+    } while (0)
+
+    AME_SFPEW_EGL(eglBindAPI,             "eglBindAPI");
+    AME_SFPEW_EGL(eglChooseConfig,        "eglChooseConfig");
+    AME_SFPEW_EGL(eglCreateContext,       "eglCreateContext");
+    AME_SFPEW_EGL(eglCreateWindowSurface, "eglCreateWindowSurface");
+    AME_SFPEW_EGL(eglDestroyContext,      "eglDestroyContext");
+    AME_SFPEW_EGL(eglDestroySurface,      "eglDestroySurface");
+    AME_SFPEW_EGL(eglGetConfigAttrib,     "eglGetConfigAttrib");
+    AME_SFPEW_EGL(eglGetCurrentContext,   "eglGetCurrentContext");
+    AME_SFPEW_EGL(eglGetCurrentSurface,   "eglGetCurrentSurface");
+    AME_SFPEW_EGL(eglGetDisplay,          "eglGetDisplay");
+    AME_SFPEW_EGL(eglGetError,            "eglGetError");
+    AME_SFPEW_EGL(eglGetPlatformDisplay,  "eglGetPlatformDisplay");
+    AME_SFPEW_EGL(eglInitialize,          "eglInitialize");
+    AME_SFPEW_EGL(eglMakeCurrent,         "eglMakeCurrent");
+    AME_SFPEW_EGL(eglReleaseThread,       "eglReleaseThread");
+    AME_SFPEW_EGL(eglSwapBuffers,         "eglSwapBuffers");
+    AME_SFPEW_EGL(eglSwapInterval,        "eglSwapInterval");
+    AME_SFPEW_EGL(eglTerminate,           "eglTerminate");
+#undef AME_SFPEW_EGL
+
+    BOOL ok = handle.eglBindAPI && handle.eglChooseConfig && handle.eglCreateContext &&
+        handle.eglCreateWindowSurface && handle.eglDestroyContext && handle.eglDestroySurface &&
+        handle.eglGetConfigAttrib && handle.eglGetDisplay && handle.eglGetError &&
+        handle.eglInitialize && handle.eglMakeCurrent && handle.eglSwapBuffers &&
+        handle.eglReleaseThread && handle.eglSwapInterval && handle.eglTerminate;
+    NSLog(@"[SFPEW-EGL] resolve %@ (createCtx=%p, makeCurrent=%p, getDisplay=%p)",
+          ok ? @"OK" : @"INCOMPLETE",
+          (void *)(uintptr_t)handle.eglCreateContext,
+          (void *)(uintptr_t)handle.eglMakeCurrent,
+          (void *)(uintptr_t)handle.eglGetDisplay);
+    return ok;
+}
+
 static bool dlsym_EGL() {
     // EGL 符号来源：
     //   - Mithril / MobileGL：自带完整 EGL 实现，必须从自身 dylib 解析。
@@ -1316,7 +1443,15 @@ static bool dlsym_EGL() {
     //
     // 其余 EGL 函数（eglChooseConfig / eglCreateWindowSurface / eglSwapBuffers 等）
     // LTW 不做 wrapper，直接从 ANGLE 解析。
-    BOOL useLTW = renderer && strcmp(renderer, RENDERER_NAME_LTW) == 0;
+    // 必须按「真后端」eglRenderer 判定，不能用 renderer：
+    // SFPEW 顶替模式下 AMETHYST_RENDERER 已是 libSimpleFPEWrapper.dylib，
+    // renderer 永远不等于 libltw.dylib，于是 useLTW 恒为 NO —— LTW 的
+    // eglCreateContext / eglDestroyContext / eglMakeCurrent 三个 wrapper 一次都
+    // 不会被解析（下面 load_egl_symbol(ltw_handle, ...) 整段被跳过），LTW 注入的
+    // 「建 ES3 上下文 + 安装 GL 函数指针转译表 + 伪装 ARB 扩展」完全不生效，
+    // 转译层形同未接入，画面必黑。非 SFPEW 模式下 eglRenderer == renderer，
+    // 与改动前逐字等价。
+    BOOL useLTW = eglRenderer && strcmp(eglRenderer, RENDERER_NAME_LTW) == 0;
     void *ltw_handle = NULL;
     if (useLTW) {
         ltw_handle = dlopen("@rpath/" RENDERER_NAME_LTW, RTLD_NOW | RTLD_LOCAL);
@@ -1352,6 +1487,32 @@ static bool dlsym_EGL() {
     // SFPEW + MobileGlues / SFPEW + MobileGL-GLES 双双崩溃的成因。
 
     memset(&handle, 0, sizeof(handle));
+
+    // [sfpew-egl-route] A/B：AMETHYST_SFPEW_EGL_ROUTE=1 时改走 (c) —— EGL 全部经
+    // SFPEW 的 eglGetProcAddress 解析（安卓/FCL 实测模型）。失败则回落到下方
+    // 真后端 dlsym 路径，不改变默认行为。
+    // Task 181：LTW 后端同样要走这条路由 —— Task 178 的 `!useLTW` 排除是反的。
+    //
+    // 关键事实：路由并不是「绕过后端」，而是「经 SFPEW 转发到后端」。SFPEW 的
+    // eglGetProcAddress 对 create/destroy/makeCurrent 返回它自己的 wrapper，而
+    // wrapper 内部调用的是 SFPEW_EGL 指向的后端 EGL —— 也就是 libltw.dylib 的
+    // eglCreateContext。LTW 注入的 wrapper（建 ES3 上下文 + 装 GL Core 3.3 -> ES 3
+    // 函数指针转译表 + 伪装 ARB 扩展）照样会被执行，一次都不会被架空。
+    //
+    // 反而是排除它会致命：eglSwapBuffers 落回后端直调，SFPEW 的 pending batch
+    // 就永远没有 drain 的机会（lookup.cpp:75-79 的注释），每帧几何被推到下一帧
+    // 再被 clear —— 这正是 LTW/ANGLE + SFPEW 全黑的成因，与 MobileGL-gles 白屏
+    // 同源。故此处不再按后端类型排除。
+    if (isSFPEWRenderer(renderer) && ameSFPEWEglRouteWanted()) {
+        if (ameSFPEWResolveEGL()) {
+            ame_sfpew_egl_route_active = YES;
+            NSLog(@"[SFPEW-EGL] route ACTIVE -- lifecycle+infra both resolved through SFPEW "
+                  @"(SFPEW forwards infra to backend via SFPEW_EGL)");
+            return true;
+        }
+        NSLog(@"[SFPEW-EGL] route requested but resolution incomplete -- falling back to backend dlsym");
+    }
+
     handle.eglBindAPI = load_egl_symbol(dl_handle, "eglBindAPI");
     handle.eglChooseConfig = load_egl_symbol(dl_handle, "eglChooseConfig");
     if (useLTW && ltw_handle) {
@@ -1452,6 +1613,17 @@ static BOOL ame_mgBootstrap(EGLDisplay dpy, EGLConfig config) {
     // 其 EGL 导出一次都不会被调用。iOS 侧等价物 = 与非叠加 mobileglues 完全
     // 相同的 AME_MG_SWAP 路径。
 
+    // [sfpew-egl-route] 路由激活时生命周期已在 SFPEW 上：SFPEW 的
+    // sfpewEglCreateContext 会转发到后端（MG）的 eglCreateContext，MGContext
+    // 由 MG 自己建立。此处若再 AME_MG_SWAP 覆盖，SFPEW 会被整个摘出 EGL 链，
+    // 回到 (b) 的 registry 恒空状态。bootstrap 的 mg_init_gles 已完成，保留。
+    if (ame_sfpew_egl_route_active) {
+        ame_mgFrontendActive = YES;
+        NSLog(@"[MG-Bridge] bootstrap done; SFPEW EGL route active -- lifecycle stays on SFPEW "
+              @"(backend reached via SFPEW_EGL, MGContext built by MG itself)");
+        return YES;
+    }
+
     void *fn = NULL;
     #define AME_MG_SWAP(field, name)                                                  \
         do {                                                                          \
@@ -1490,25 +1662,50 @@ static bool gl_init() {
     return true;
 }
 
+// SFPEW 叠加时是否仍按真后端判定 desktop GL（诊断逃逸阀，默认否）。
+static BOOL ameSFPEWForceDesktopGL(void) {
+    const char *v = getenv("AMETHYST_SFPEW_DESKTOPGL");
+    return v != NULL && v[0] != '\0' && v[0] != '0';
+}
+
 gl_render_window_t* gl_init_context(gl_render_window_t *share) {
     gl_render_window_t* bundle = calloc(1, sizeof(gl_render_window_t));
 
     NSString *renderer = NSProcessInfo.processInfo.environment[@"AMETHYST_RENDERER"];
-    // SFPEW 叠加模式下 AMETHYST_RENDERER 已被换成 libSimpleFPEWrapper.dylib，但
-    // 「导出的是 desktop OpenGL 还是 OpenGL ES」取决于真后端，与 dlsym_EGL() 里
-    // EGL 来源的判定必须一致（真后端名在 AMETHYST_SFPEW_BACKEND）。
-    // 若按 SFPEW 判定，MobileGL-gles（desktop GL）会被当成 ES 后端：
-    // eglChooseConfig 请求 EGL_OPENGL_ES3_BIT、eglBindAPI(EGL_OPENGL_ES_API)，
-    // 而 MobileGL 导出的是 desktop OpenGL → 上下文类型不匹配 →
-    // glCheckFramebufferStatus 返回垃圾值（如 0x582B0D8）崩溃。
+    // SFPEW 叠加模式下 AMETHYST_RENDERER 已被换成 libSimpleFPEWrapper.dylib，
+    // 真后端名在 AMETHYST_SFPEW_BACKEND（EGL 来源判定用它，见 dlsym_EGL()）。
     const char *apiRenderer = renderer.UTF8String;
-    if (isSFPEWRenderer(apiRenderer)) {
+    const BOOL sfpewActive = isSFPEWRenderer(apiRenderer);
+    if (sfpewActive) {
         const char *sfpewBackend = getenv("AMETHYST_SFPEW_BACKEND");
         if (sfpewBackend != NULL && sfpewBackend[0] != '\0') apiRenderer = sfpewBackend;
     }
     // ANGLE / Mithril / MobileGL 导出的都是 desktop OpenGL，走 EGL_OPENGL_BIT +
     // eglBindAPI(EGL_OPENGL_API)；其余（gl4es / MobileGlues / LTW）是 OpenGL ES。
     BOOL desktopGL = isDesktopGLRenderer(apiRenderer);
+    // ---- SFPEW 叠加：上下文一律走 OpenGL ES ----------------------------------
+    // SFPEW 生成的固定管线着色器恒为 `#version 300 es`（fpe_shadergen.cpp 的
+    // mg_shader_header，VS/FS 两处无条件拼接，没有 desktop 分支）。所以只要
+    // SFPEW 在场，上下文就必须是 ES —— 哪怕真后端自述为 desktop GL 也一样。
+    //
+    // MobileGL-gles 是最典型的反例：GL_VERSION 报 "4.6.0 MobileGL 26.09-dev,
+    // Direct (OpenGL ES) Backend"，EGL 由 ANGLE 提供、只有 ES 档；SFPEW 自己
+    // 也据此把它判成 ES 后端（capabilities.cpp 的 sfpewBackendTakesBgra 会为
+    // 它做 BGRA 重排）。但我们此前按真后端名命中 isDesktopGLRenderer，请求
+    // EGL_OPENGL_BIT + eglBindAPI(EGL_OPENGL_API)，把 ES 3.00 着色器交给了
+    // desktop 上下文 → 编译/链接失败 → 用无效 program 绘制 →
+    // GL_INVALID_OPERATION(1282) 在 Pre/Post startup、Pre/Post render 刷屏。
+    //
+    // 安卓侧 eglBindAPI 同样以 ES 为默认（仅 zink 走 desktop），与此一致。
+    // 逃逸阀：AMETHYST_SFPEW_DESKTOPGL=1 恢复「按真后端判定」的旧行为。
+    if (sfpewActive && !ameSFPEWForceDesktopGL()) {
+        if (desktopGL) {
+            NSDebugLog(@"EGLBridge: SFPEW overlay active -- forcing OpenGL ES context "
+                       @"(FPE shaders are #version 300 es, backend '%s' self-reports desktop GL)",
+                       apiRenderer);
+        }
+        desktopGL = NO;
+    }
     BOOL mobileGL = isMobileGLRenderer(apiRenderer);
 
     const EGLint attribs[] = {

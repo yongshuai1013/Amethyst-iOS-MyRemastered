@@ -75,6 +75,12 @@
 #define RENDERER_NAME_MOBILEGL "libMobileGL.dylib"
 #define RENDERER_NAME_MOBILEGL_GLES "libMobileGL-gles.dylib"
 
+// NG-GL4ES（"Krypton Wrapper"，BZLZHH/NG-GL4ES）—— ZalithLauncher 2 用的 gl4es 分支：
+// 能处理更高级的着色器、几乎全 MC 版本可跑（glslang + SPIRV-Cross 着色器管线）。
+// 与 holy gl4es 不同，它自带 ARB 着色器转译管线；EGL 仍由宿主 ANGLE 提供
+// （dylib 只做 GL 转译，零 EGL 动作）。vendored 源码见 ThirdParty/ZalithLauncher2。
+#define RENDERER_NAME_NGGL4ES "libnggl4es.dylib"
+
 // SimpleFPEWrapper（MobileGL-Dev，LGPL-3.0）—— 固定管线 (GL 1.x) 仿真层。
 // 接入方式对齐安卓 AngelAuraMC/Amethyst-Android @ feat/sfpew_angle：SFPEW 顶替
 // 渲染器被 LWJGL dlopen，真正的后端 EGL 由环境变量 SFPEW_EGL 指定，SFPEW 内部
@@ -137,6 +143,22 @@ int csops(pid_t pid, unsigned int ops, void *useraddr, size_t usersize);
 BOOL isJITEnabled(BOOL checkCSOps);
 // legacy method used to check if we're using universal script
 void* JIT26CreateRegionLegacy(size_t len);
+// JIT26 调试器存活探针（议题 #133）：CS_DEBUGGED 只是"曾经启用过"的持久标志，
+// 外部工具瞬时附加后退出会残留置位；TXM 机型上 launchJVM 的 brk #0x69 必须由
+// 活的调试器现场服务，否则 EXC_BREAKPOINT 秒闪退。状态显示继续用 isJITEnabled，
+// 启动决策用这组探针（三探针任一命中即在岗：ppid!=1 / P_TRACED / 任务异常端口）。
+BOOL JIT26IsLikelyDebuggerKeepAttached(void);
+BOOL JIT26DebuggerAttachedViaPtrace(void);
+BOOL JIT26DebuggerViaExceptionPorts(void);
+// brk #0x69 的 SIGTRAP 安全网包装：无人应答时返回 NULL 而不是致死崩溃，
+// 由调用方走优雅报错路径；调试器正常应答时行为与裸函数完全一致。
+void* JIT26CreateRegionLegacySafe(size_t len);
+// JIT 等待轮询的有界版本（最长 timeout 秒，每 10s 心跳日志，挂起间隙不计入
+// 超时预算，超时返回 NO）。替代裸 while(!isJITEnabled) 死循环。
+BOOL ame169_waitForJITCondition(BOOL (^condition)(void), NSTimeInterval timeout, NSString *label);
+// JIT 等待成功后的自愈式主队列派发（三道防线：常规派发 / 前台激活重派 /
+// 后台看门狗重派并钉死未送达锚点），防主队列续接块丢失导致启动卡死。
+void ame185_dispatchToMainSelfHealing(dispatch_block_t block, NSString *label);
 // used for large memory regions
 void* JIT26PrepareRegion(void *addr, size_t len);
 // same as JIT26PrepareRegion, but used for smaller memory regions
@@ -177,6 +199,9 @@ void openLink(UIViewController* sender, NSURL* link);
 void handle_fatal_exit(int code);
 
 NSString* localize(NSString* key, NSString* comment);
+// YES 表示 NSError 是"当前没有可用网络"，而非服务器返回了不喜欢的内容。
+// 账户刷新只认 NSURLErrorDataNotAllowed 会漏掉飞行模式/无 Wi-Fi 等常见离线形态。
+BOOL isConnectivityError(NSError *error);
 NSMutableDictionary* parseJSONFromFile(NSString *path);
 NSError* saveJSONToFile(NSDictionary *dict, NSString *path);
 void customNSLog(const char *file, int lineNumber, const char *functionName, NSString *format, ...);

@@ -601,6 +601,35 @@ bool mg_unit_holds_depth_texture(int unit) {
     return g_depth_textures.count(tex) != 0;
 }
 
+// Task 181 (perf) -- per-unit cache for the driver confirmations
+// mg_enforce_depth_sampling_nearest() makes on an untracked host. See the
+// comment at the use site for why those round trips are worth caching; the
+// short version is that on iOS/ANGLE the application drives ANGLE's libEGL
+// directly, so the shadow is the shared fallback record and every depth hint is
+// confirmed against the driver on every draw of every frame.
+//
+// The binding a confirmation reads is GL_TEXTURE_2D on that unit, and the only
+// entry point that moves it is this layer's own glBindTexture -- which is also
+// what writes the fallback record -- so dropping the entry from glBindTexture
+// keeps the cache honest. Anything that bypassed both would have bypassed the
+// shadow too and could not have been confirmed from it in the first place.
+// MG_DEPTH_CONFIRM_CACHE=0 restores the old always-ask behaviour.
+static GLuint mg_confirm_cache_tex[MAX_TEXTURE_IMAGE_UNITS];
+static bool mg_confirm_cache_valid[MAX_TEXTURE_IMAGE_UNITS];
+
+static bool mg_depth_confirm_cache_enabled() {
+    static int cached = -1;
+    if (cached < 0) {
+        const char* v = std::getenv("MG_DEPTH_CONFIRM_CACHE");
+        cached = (v != nullptr && std::strcmp(v, "0") == 0) ? 0 : 1;
+    }
+    return cached == 1;
+}
+
+static void mg_invalidate_depth_confirm(int unit) {
+    if (unit >= 0 && unit < MAX_TEXTURE_IMAGE_UNITS) mg_confirm_cache_valid[unit] = false;
+}
+
 void mg_enforce_depth_sampling_nearest(void) {
     // Two modes, same two passes.
     //
@@ -684,7 +713,12 @@ void mg_enforce_depth_sampling_nearest(void) {
     // composite binds one NEAREST cache sampler across all twelve of its
     // inputs): a single pass scanning units in order would force on unit 1 and
     // restore on unit 0 and leave the draw with whichever came last.
-    ska::flat_hash_map<GLuint, bool> wants_force;
+    // Task 181 (perf): this used to be a fresh local on every draw, so MC 26.3's
+    // thousands of draws a frame meant thousands of map allocations a frame for
+    // a map that is rebuilt from scratch every call anyway. Reused per thread;
+    // contents are still recomputed from scratch, so behaviour is unchanged.
+    static thread_local ska::flat_hash_map<GLuint, bool> wants_force;
+    wants_force.clear();
     bool confirm_borrowed = false;
     GLint saved_active = GL_TEXTURE0;
     for (int u = 0; u < MAX_TEXTURE_IMAGE_UNITS; ++u) {
@@ -696,15 +730,33 @@ void mg_enforce_depth_sampling_nearest(void) {
         bool holds_depth = tex != 0 && g_depth_textures.count(tex) != 0;
         if (holds_depth && confirm_hints) {
             // Hint came from the shared fallback record -- the driver decides.
-            if (!confirm_borrowed) {
-                GLES.glGetIntegerv(GL_ACTIVE_TEXTURE, &saved_active);
-                confirm_borrowed = true;
+            //
+            // Task 181 (perf): on an untracked host confirm_hints is true for
+            // every draw, and each confirmed unit cost glActiveTexture +
+            // glGetIntegerv + glGetError. MC 26.3 issues thousands of draws a
+            // frame and the transparency composite alone reads six depth units,
+            // so that was tens of thousands of driver round trips a frame --
+            // round trips whose answer only changes when glBindTexture moves the
+            // unit. Cached per unit (see the note above the cache); a stale
+            // entry can only ever be a rejected confirmation, because the depth
+            // test itself is still run against the freshly confirmed name.
+            GLuint confirmed_tex = 0;
+            if (mg_depth_confirm_cache_enabled() && mg_confirm_cache_valid[u]) {
+                confirmed_tex = mg_confirm_cache_tex[u];
+            } else {
+                if (!confirm_borrowed) {
+                    GLES.glGetIntegerv(GL_ACTIVE_TEXTURE, &saved_active);
+                    confirm_borrowed = true;
+                }
+                GLES.glActiveTexture(GL_TEXTURE0 + u);
+                GLint confirmed = 0;
+                GLES.glGetIntegerv(GL_TEXTURE_BINDING_2D, &confirmed);
+                GLES.glGetError(); // keep the scan's own queries from leaving an error parked
+                confirmed_tex = static_cast<GLuint>(confirmed);
+                mg_confirm_cache_tex[u] = confirmed_tex;
+                mg_confirm_cache_valid[u] = true;
             }
-            GLES.glActiveTexture(GL_TEXTURE0 + u);
-            GLint confirmed = 0;
-            GLES.glGetIntegerv(GL_TEXTURE_BINDING_2D, &confirmed);
-            GLES.glGetError(); // keep the scan's own queries from leaving an error parked
-            holds_depth = confirmed != 0 && g_depth_textures.count((GLuint)confirmed) != 0;
+            holds_depth = confirmed_tex != 0 && g_depth_textures.count(confirmed_tex) != 0;
         }
         if (holds_depth) want = true;
     }
@@ -2009,6 +2061,12 @@ void glBindTexture(GLenum target, GLuint texture) {
             GLES.glBindTexture(target, texture);
         }
         set_driver_texture_binding(driver_unit, driver_target, texture);
+        // Task 181 (perf): the driver-side GL_TEXTURE_2D binding this unit just
+        // took is exactly what mg_enforce_depth_sampling_nearest caches its
+        // per-unit confirmations from, so the cached answer for this unit dies
+        // here. Other targets cannot move a TEXTURE_2D binding and are left
+        // alone, which keeps the cache warm across the bulk of MC's binds.
+        if (driver_target == TextureTarget::TEXTURE_2D) mg_invalidate_depth_confirm(driver_unit);
     }
     CHECK_GL_ERROR_NO_INIT
 

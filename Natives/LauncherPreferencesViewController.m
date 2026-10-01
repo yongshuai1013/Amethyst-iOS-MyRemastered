@@ -636,6 +636,11 @@
               @"action": ^void(){
                   [self checkForUpdateFromSettings];
               }
+            },
+            @{@"key": @"auto_check_update",
+              @"hasDetail": @YES,
+              @"icon": @"arrow.triangle.2.circlepath",
+              @"type": self.typeSwitch
             }
         ], @[
             // Download mirror policy settings（分类镜像策略，由 PLMirrorCenter 统一读取）
@@ -729,6 +734,18 @@
               @"type": self.typeSlider,
               @"min": @(25),
               @"max": @(150)
+            },
+            // 启动器侧 FSR1（EASU 边缘自适应上采样 + RCAS 锐化）。
+            // 它接管 video.resolution 的缩放：把原本由 CoreAnimation 做的双线性
+            // 拉伸换成 FSR1，低分辨率渲染 + 高质量还原，换帧率。
+            // 位置在 EGL 之上、渲染器之外，只依赖当前上下文能解析到的 GL 入口点，
+            // 因此不挑后端（MG / MobileGlues / ANGLE / LTW / SFPEW 通用）。
+            // 只有 video.resolution < 100% 时才真正介入；100% 时无东西可上采样。
+            @{@"key": @"fsr1",
+              @"hasDetail": @YES,
+              @"icon": @"arrow.up.left.and.arrow.up.right",
+              @"type": self.typeSwitch,
+              @"enableCondition": whenNotInGame
             },
             // 帧率限制选项已移除：CADisplayLink 始终采用 30-120Hz 自适应范围，
             // 由屏幕硬件能力决定实际帧率（60Hz 设备仍为 60，120Hz ProMotion 设备可达 120）。
@@ -1150,6 +1167,46 @@
                 @"type": self.typeSwitch,
                 @"enableCondition": whenNotInGame
             },
+            // --- [Task 134] JIT 开启工具（参照 Air，多工具方案） ---
+            // 部分用户没有安装 StikDebug 而使用 SideStore/StosDebug/JITStreamer
+            // 等其它工具——此前安装器只认 StikDebug（"点了没反应、JIT
+            // 永远开不了"）。现提供工具选择：auto 沿用原自动判定，其余选项
+            // 强制走对应工具的 URL scheme（Task139 消费）。
+            @{@"key": @"jit_enabler",
+                @"hasDetail": @YES,
+                @"icon": @"bolt.badge.clock",
+                @"type": self.typePickField,
+                @"enableCondition": whenNotInGame,
+                @"pickKeys": @[
+                    @"auto",
+                    @"stikjit",
+                    @"sidestore",
+                    @"stosdebug",
+                    @"jitstreamer",
+                    @"trollstore",
+                    @"manual"
+                ],
+                @"pickList": @[
+                    localize(@"preference.debug.jit_enabler.auto", nil),
+                    localize(@"preference.debug.jit_enabler.stikjit", nil),
+                    localize(@"preference.debug.jit_enabler.sidestore", nil),
+                    localize(@"preference.debug.jit_enabler.stosdebug", nil),
+                    localize(@"preference.debug.jit_enabler.jitstreamer", nil),
+                    localize(@"preference.debug.jit_enabler.trollstore", nil),
+                    localize(@"preference.debug.jit_enabler.manual", nil)
+                ]
+            },
+            // --- [Task 134] iOS 26 JS 脚本 JIT 开关（参照 Air） ---
+            // 关闭后 stikjit:// 请求不再附带 UniversalJIT26.js 的
+            // script-data（纯调试器附加式 JIT）。注意：TXM 设备（系统级
+            // 内存映射依赖脚本服务 brk）关闭后可能无法启动游戏。
+            @{@"key": @"jit26_script_disable",
+                @"hasDetail": @YES,
+                @"icon": @"scroll",
+                @"type": self.typeSwitch,
+                @"enableCondition": whenNotInGame,
+                @"requestReload": @YES
+            },
             @{@"key": @"debug_hide_home_indicator",
                 @"hasDetail": @YES,
                 @"icon": @"iphone.and.arrow.forward",
@@ -1491,36 +1548,11 @@
 
 #pragma mark - Check For Update
 
-/// 设置页"检查更新"入口：调用 UpdateChecker 检查正式版更新，弹窗显示结果。
+/// 设置页"检查更新"入口（参照 ZL2 手动检查）：
+/// 走 UpdateDialogViewController 弹窗 —— 顶部版本号、中间完整可滚动的更新日志、
+/// 底部"忽略此版本 / 稍后 / 更新"，点更新跳转到本次查到的那个 release 页面。
 - (void)checkForUpdateFromSettings {
-    /* 显示加载中的 alert */
-    UIAlertController *loadingAlert = [UIAlertController
-        alertControllerWithTitle:localize(@"check_update.checking", @"正在检查更新…")
-                         message:nil
-                  preferredStyle:UIAlertControllerStyleAlert];
-    [self presentViewController:loadingAlert animated:YES completion:nil];
-
-    [UpdateChecker checkForUpdateWithCompletion:^(UpdateInfo *info, NSError *error) {
-        [loadingAlert dismissViewControllerAnimated:YES completion:^{
-            if (error || info == nil) {
-                [self showUpdateAlertWithTitle:localize(@"check_update.failed", @"检查更新失败")
-                                         message:error.localizedDescription ?: localize(@"i18n_str_97", nil)
-                                       hasUpdate:NO
-                                          info:nil];
-                return;
-            }
-            if (info.hasUpdate) {
-                [self showUpdateAvailableAlert:info];
-            } else {
-                [self showUpdateAlertWithTitle:localize(@"check_update.up_to_date", @"已是最新版本")
-                                         message:[NSString stringWithFormat:
-                                             localize(@"check_update.current_version", @"当前版本 %@，已是最新正式版。"),
-                                             info.currentVersion]
-                                       hasUpdate:NO
-                                          info:nil];
-            }
-        }];
-    }];
+    [UpdateChecker performManualCheckFromPresenter:self showUpToDate:YES];
 }
 
 - (void)showUpdateAlertWithTitle:(NSString *)title

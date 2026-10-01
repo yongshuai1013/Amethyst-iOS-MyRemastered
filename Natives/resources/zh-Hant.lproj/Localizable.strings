@@ -245,6 +245,7 @@
 "preference.title.renderer.debug.zink" = "Zink (Mesa 25.0.7) － 輸出OpenGL 4.1";
 "preference.title.renderer.debug.ltw" = "LTW - OpenGL Core→ES 转译（1.17+）";
 "preference.title.renderer.debug.vulkan" = "MoltenVK（26.2+）- 导出 Vulkan 1.4";
+"preference.title.renderer.debug.nggl4es" = "Krypton Wrapper（≤26.2）- ZL2 同款 gl4es，舊版本首選（原 NG-GL4ES）";
 
 "preference.detail.renderer" = "改變要使用的OpenGL渲染引擎";
 
@@ -1954,3 +1955,31 @@
 
 "preference.auto" = "自动";
 "preference.auto_select" = "自动选择";
+
+"i18n_str_jit26_pending" = "JIT：已啟用（啟動時自動附加）";
+"jit.timeout_retry_msg" = "等待 JIT 超時（120 秒），JIT 工具可能未響應。點重試可再試一次，也可手動附加調試器後重試。";
+"jit.retry" = "重試";
+
+// Task 134: JIT 開啟工具選擇（參照 Air 移植）
+"preference.debug.jit_enabler.auto" = "自動（建議）";
+"preference.debug.jit_enabler.stikjit" = "StikDebug / StikJIT";
+"preference.debug.jit_enabler.sidestore" = "SideStore";
+"preference.debug.jit_enabler.stosdebug" = "StosDebug";
+"preference.debug.jit_enabler.jitstreamer" = "JitStreamer-EB";
+"preference.debug.jit_enabler.trollstore" = "TrollStore";
+"preference.debug.jit_enabler.manual" = "手動（自行附加除錯器）";
+"preference.title.jit_enabler" = "JIT 開啟工具";
+"preference.detail.jit_enabler" = "選擇用於開啟 JIT 的工具。沒有安裝 StikDebug 的使用者請改選 SideStore、StosDebug、JitStreamer-EB 或 TrollStore，否則點擊啟動可能沒有任何反應。預設自動：依裝置狀態依序嘗試 TrollStore、StikDebug、SideStore。";
+"preference.title.jit26_script_disable" = "停用 iOS 26 JS 指令碼 JIT";
+"preference.detail.jit26_script_disable" = "啟動遊戲時不再向 JIT 工具傳送 UniversalJIT26.js 指令碼（純除錯器附加式 JIT）。僅當你的工具不支援指令碼、或指令碼導致異常時才需要開啟；依賴系統級記憶體映射的裝置（TXM）開啟後可能無法啟動遊戲。";
+"i18n_str_jit26_not_ready" = "JIT26 偵錯器尚未就緒：JIT 中斷點無人應答。請確認已在 StikDebug 中指定 Universal JIT 腳本並重新開啟 JIT，然後再點擊啟動。";
+
+// 啟動器檢查更新（ZL2 風格彈窗 + 啟動自動檢查）
+"update_dialog.title" = "發現新版本";
+"update_dialog.version_from" = "%@（目前：%@）";
+"update_dialog.published_at" = "發佈於 %@";
+"update_dialog.ignore" = "忽略此版本";
+"update_dialog.later" = "稍後";
+"update_dialog.update" = "更新";
+"preference.title.auto_check_update" = "啟動時檢查更新";
+"preference.detail.auto_check_update" = "啟動啟動器時自動檢查 GitHub Releases。每小時最多檢查一次，被你選擇忽略的版本將不再提示。";

@@ -1206,8 +1206,24 @@ bool sfpewPrepareBgraUpload(GLsizei width, GLsizei height, GLenum type, const vo
     const uint8_t* source = nullptr;
     GLuint copy_scratch = 0;
     if (pbo != 0) {
-        if (g_glFuncs.glMapBufferRange == nullptr || g_glFuncs.glUnmapBuffer == nullptr)
+        if (g_glFuncs.glMapBufferRange == nullptr || g_glFuncs.glUnmapBuffer == nullptr ||
+            g_glFuncs.glGetBufferParameteriv == nullptr)
             return false;
+        // iOS / MobileGlues: 后端的 glMapBufferRange 与 glCopyBufferSubData 都不做
+        // 越界校验。needed 一旦超过 PBO 的实际字节数，memcpy/memmove 会读到缓冲
+        // 区之外，SIGSEGV 直接落在 _platform_memmove —— 崩溃帧里连本层的名字都
+        // 不会出现，看上去像凭空死掉。照同文件 captureCompressedListPayload()
+        // 的范例先量一次 buffer：越界就放弃转换走 passthrough，宁可颜色通道不对
+        // 也不要崩。
+        const size_t pbo_offset = (size_t)(uintptr_t)pixels;
+        GLint buffer_size = 0;
+        g_glFuncs.glGetBufferParameteriv(GL_PIXEL_UNPACK_BUFFER, GL_BUFFER_SIZE, &buffer_size);
+        if (buffer_size <= 0 || pbo_offset > (size_t)buffer_size ||
+            needed > (size_t)buffer_size - pbo_offset) {
+            SFPEW_LOGW("BGRA upload: unpack buffer %d has no %zu bytes at offset %zu (size %d); "
+                       "conversion impossible", pbo, needed, pbo_offset, buffer_size);
+            return false;
+        }
         // SFPEW_TEST_FORCE_BGRA_COPY=1: pretend the direct mapping failed,
         // exercising the copy path below on drivers whose direct mapping
         // succeeds. The copy path exists FOR drivers where it does not

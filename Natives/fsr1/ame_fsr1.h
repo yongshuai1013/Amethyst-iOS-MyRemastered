@@ -48,6 +48,13 @@ bool ameFsr1RenderSize(int surfaceW, int surfaceH, int *outW, int *outH);
 /// 立即返回 —— 绝不会让画面停在中途状态。
 void ameFsr1Present(int surfaceW, int surfaceH);
 
+/// 只保证「画面铺满」，不做上采样。
+///
+/// egl_bridge 在跳过了 FSR1 pass 的帧（编译风暴期、符号未解析等）调用它：
+/// 只要本帧不上采样，就必须把左下角内容铺满，否则画面缩在 surface 一角且
+/// 无法自愈（surface 只创建一次）。
+void ameFsr1KeepFullScreen(int surfaceW, int surfaceH);
+
 /// 供调试：把当前状态打进日志。
 void ameFsr1DumpState(void);
 

@@ -976,10 +976,22 @@ void pojavSwapBuffers() {
     // 位置必须在 viewport 守护之后 —— 守护保证当前 viewport 等于渲染分辨率，
     // fsr1 正是拿 viewport 当源区域（自适应，不依赖理论值）。
     // 编译风暴期间同样跳过：那时画面还没稳定，多一趟全屏 pass 纯属浪费。
-    if (heavyWorkAllowed) {
+    // 几何前提与是否上采样无关：只要 FSR1 接管了几何（surface 全分辨率 +
+    // MC 低分辨率绘制），任何跳过了上采样 pass 的帧都必须走保底铺满，否则
+    // 画面缩在 surface 一角 —— 而 surface 只创建一次，不会自愈。
+    {
+        static BOOL fsrSizeLogged = NO;
         int fsrW = 0, fsrH = 0;
         if (pojavEglSurfacePixelSize(&fsrW, &fsrH) && fsrW > 0 && fsrH > 0) {
-            ameFsr1Present(fsrW, fsrH);
+            if (heavyWorkAllowed) {
+                ameFsr1Present(fsrW, fsrH);
+            } else {
+                ameFsr1KeepFullScreen(fsrW, fsrH);
+            }
+        } else if (!fsrSizeLogged) {
+            fsrSizeLogged = YES;
+            NSLog(@"[FSR1] skipped: EGL surface pixel size unavailable (%dx%d)",
+                  fsrW, fsrH);
         }
     }
 

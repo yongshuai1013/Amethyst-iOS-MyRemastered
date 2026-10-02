@@ -87,6 +87,7 @@ static int   g_rendererMiss   = 0;
 // 诊断用：解析失败/空转都只打一次，避免每帧刷屏（日志会瞬间顶满）。
 static BOOL  g_resolveFailLogged = NO;
 static BOOL  g_unresolvedLogged  = NO;
+static BOOL  g_entryLogged        = NO;
 static BOOL  g_idleLogged        = NO;
 
 static void *ameRendererHandle(void) {
@@ -462,6 +463,7 @@ typedef struct {
 
     int     surfaceW, surfaceH;   // EGL surface（全分辨率）
     int     renderW,  renderH;    // 渲染分辨率（低）
+    int     deadW,    deadH;      // 置死时的 surface 几何（用于几何变化后复活）
 
     ame_GLuint texLow;      // 渲染分辨率的拷贝
     ame_GLuint fboLow;
@@ -474,6 +476,25 @@ typedef struct {
 } AmeFsr1State;
 
 static AmeFsr1State g_s = {0};
+
+static void ameReleaseResources(void);   // 定义在下方「资源」一节
+
+// —— 置死（自我关闭）——
+// 记录置死时的 surface 几何：几何变了（改分辨率、旋转、重建 surface）就允许
+// 复活重试。旧行为是「出过一次错就永久关闭」，于是启动期的任何瞬时故障
+// （ANGLE 还在建面、MC 临时绑着离屏 FBO、上下文刚切换）都会让 FSR1 在本局
+// 余下时间彻底沉默，且日志里只有一行 disabled —— 用户看到的是「开了没效果」。
+// 复活只在几何真的变化时发生，不会在正常帧循环里反复重试失败的操作。
+static void ameMarkDead(int surfaceW, int surfaceH) {
+    if (!g_s.dead) {
+        NSLog(@"[FSR1] self-disabled at surface %dx%d (recovers if the surface geometry changes)",
+              surfaceW, surfaceH);
+    }
+    g_s.dead = YES;
+    g_s.deadW = surfaceW;
+    g_s.deadH = surfaceH;
+    ameReleaseResources();
+}
 
 static float ameFsr1Scale(void) {
     // 优先环境变量（便于 A/B，不用改设置），其次设置项。
@@ -691,13 +712,177 @@ static BOOL ameBuild(int surfaceW, int surfaceH, int renderW, int renderH) {
     return YES;
 }
 
+
+// ---------------------------------------------------------------------------
+// 降级拉伸网
+// ---------------------------------------------------------------------------
+// FSR1 接管时 surface 按全分辨率创建，MC 按低分辨率绘制、画面落在左下角。
+// 只要本帧放弃上采样（置死 / GL 入口点未解析 / 开关关闭 / 源区域异常），
+// 若不做任何事，左下角那块内容会被 CoreAnimation 拉伸上屏 —— 即用户看到的
+// 「画面跑到左下角、被放大且超出屏幕」，且 surface 只创建一次，永远无法自愈。
+//
+// 这里在放弃本帧之前把左下角内容线性铺满 surface：观感退回「未开 FSR1」
+// （只是不再省性能），但绝不停在毁掉的半截画面上。
+//
+// 必须用独立中转 FBO：GLES3 规范禁止 read/draw 同时绑定 0 且源、目标矩形
+// 重叠的 glBlitFramebuffer（会 INVALID_OPERATION）。故走两段：
+//   framebuffer 0 左下角  ->  stretchFbo（同尺寸，NEAREST）
+//   stretchFbo            ->  framebuffer 0 全尺寸（LINEAR）
+static ame_GLuint g_stretchTex = 0;
+static ame_GLuint g_stretchFbo = 0;
+static int        g_stretchW = 0;
+static int        g_stretchH = 0;
+static BOOL       g_stretchLogged = NO;
+static BOOL       g_stretchBroken = NO;
+
+static void ameStretchRelease(void) {
+    if (g_stretchFbo != 0 && ame_glDeleteFramebuffers != NULL) {
+        ame_glDeleteFramebuffers(1, &g_stretchFbo);
+    }
+    if (g_stretchTex != 0 && ame_glDeleteTextures != NULL) {
+        ame_glDeleteTextures(1, &g_stretchTex);
+    }
+    g_stretchFbo = 0; g_stretchTex = 0; g_stretchW = 0; g_stretchH = 0;
+}
+
+static BOOL ameStretchEnsure(int w, int h) {
+    if (g_stretchBroken) return NO;
+    if (g_stretchFbo != 0 && g_stretchW == w && g_stretchH == h) return YES;
+    if (ame_glGenTextures == NULL || ame_glGenFramebuffers == NULL ||
+        ame_glBindTexture == NULL || ame_glTexImage2D == NULL ||
+        ame_glTexParameteri == NULL || ame_glBindFramebuffer == NULL ||
+        ame_glFramebufferTexture2D == NULL || ame_glCheckFramebufferStatus == NULL) {
+        return NO;
+    }
+    ameStretchRelease();
+    ame_glGenTextures(1, &g_stretchTex);
+    if (g_stretchTex == 0) return NO;
+    ame_glBindTexture(AME_GL_TEXTURE_2D, g_stretchTex);
+    ame_glTexImage2D(AME_GL_TEXTURE_2D, 0, (ame_GLint)AME_GL_RGBA8,
+                     (ame_GLsizei)w, (ame_GLsizei)h, 0,
+                     AME_GL_RGBA, AME_GL_UNSIGNED_BYTE, NULL);
+    ame_glTexParameteri(AME_GL_TEXTURE_2D, AME_GL_TEXTURE_MIN_FILTER, AME_GL_LINEAR);
+    ame_glTexParameteri(AME_GL_TEXTURE_2D, AME_GL_TEXTURE_MAG_FILTER, AME_GL_LINEAR);
+    ame_glTexParameteri(AME_GL_TEXTURE_2D, AME_GL_TEXTURE_WRAP_S, AME_GL_CLAMP_TO_EDGE);
+    ame_glTexParameteri(AME_GL_TEXTURE_2D, AME_GL_TEXTURE_WRAP_T, AME_GL_CLAMP_TO_EDGE);
+    ame_glTexParameteri(AME_GL_TEXTURE_2D, AME_GL_TEXTURE_MAX_LEVEL, 0);
+    ame_glGenFramebuffers(1, &g_stretchFbo);
+    if (g_stretchFbo == 0) { ameStretchRelease(); return NO; }
+    ame_glBindFramebuffer(AME_GL_FRAMEBUFFER, g_stretchFbo);
+    ame_glFramebufferTexture2D(AME_GL_FRAMEBUFFER, AME_GL_COLOR_ATTACHMENT0,
+                               AME_GL_TEXTURE_2D, g_stretchTex, 0);
+    ame_GLenum st = ame_glCheckFramebufferStatus(AME_GL_FRAMEBUFFER);
+    ame_glBindFramebuffer(AME_GL_FRAMEBUFFER, 0);
+    if (st != AME_GL_FRAMEBUFFER_COMPLETE) {
+        if (!g_stretchLogged) {
+            g_stretchLogged = YES;
+            NSLog(@"[FSR1] stretch fallback FBO incomplete (status=0x%x)", (unsigned)st);
+        }
+        ameStretchRelease();
+        g_stretchBroken = YES;
+        return NO;
+    }
+    g_stretchW = w; g_stretchH = h;
+    return YES;
+}
+
+/// 把 framebuffer 0 左下角的低分辨率内容线性铺满整块 surface。
+/// 任何前置条件不满足都安静返回（不改变任何 GL 状态）。
+static void ameStretchToSurface(int surfaceW, int surfaceH) {
+    if (g_stretchBroken) return;
+    if (surfaceW <= 0 || surfaceH <= 0) return;
+    if (ame_glGetIntegerv == NULL || ame_glBindFramebuffer == NULL ||
+        ame_glBlitFramebuffer == NULL) return;
+
+    ame_GLint vp[4] = {0, 0, 0, 0};
+    ame_glGetIntegerv(AME_GL_VIEWPORT, vp);
+    int srcW = vp[2], srcH = vp[3];
+    if (srcW < 2 || srcH < 2) return;
+    if (srcW > surfaceW) srcW = surfaceW;
+    if (srcH > surfaceH) srcH = surfaceH;
+    // 源已铺满 —— 没有可拉伸的东西（正常未缩放场景），什么都不做
+    if (srcW >= surfaceW && srcH >= surfaceH) return;
+
+    if (!ameStretchEnsure(srcW, srcH)) return;
+
+    ame_GLint prevFbo = 0;
+    ame_glGetIntegerv(AME_GL_FRAMEBUFFER_BINDING, &prevFbo);
+
+    ameDrainErrors();
+
+    ame_glBindFramebuffer(AME_GL_READ_FRAMEBUFFER, 0);
+    ame_glBindFramebuffer(AME_GL_DRAW_FRAMEBUFFER, g_stretchFbo);
+    ame_glBlitFramebuffer(0, 0, srcW, srcH,
+                          0, 0, srcW, srcH,
+                          AME_GL_COLOR_BUFFER_BIT, AME_GL_NEAREST);
+
+    ame_glBindFramebuffer(AME_GL_READ_FRAMEBUFFER, g_stretchFbo);
+    ame_glBindFramebuffer(AME_GL_DRAW_FRAMEBUFFER, 0);
+    ame_glBlitFramebuffer(0, 0, srcW, srcH,
+                          0, 0, surfaceW, surfaceH,
+                          AME_GL_COLOR_BUFFER_BIT, AME_GL_LINEAR);
+
+    BOOL bad = (ame_glGetError() != AME_GL_NO_ERROR);
+
+    ame_glBindFramebuffer(AME_GL_READ_FRAMEBUFFER, (ame_GLuint)prevFbo);
+    ame_glBindFramebuffer(AME_GL_DRAW_FRAMEBUFFER, (ame_GLuint)prevFbo);
+
+    if (bad) {
+        if (!g_stretchLogged) {
+            g_stretchLogged = YES;
+            NSLog(@"[FSR1] stretch fallback blit failed -- giving up (screen keeps the "
+                  @"un-upscaled layout rather than a broken half frame)");
+        }
+        ameStretchRelease();
+        g_stretchBroken = YES;
+        return;
+    }
+    if (!g_stretchLogged) {
+        g_stretchLogged = YES;
+        NSLog(@"[FSR1] stretch fallback ACTIVE: %dx%d -> %dx%d (FSR1 pass skipped this "
+              @"frame; layout kept full-screen, quality reverts to bilinear)",
+              srcW, srcH, surfaceW, surfaceH);
+    }
+}
+
 // ---------------------------------------------------------------------------
 // 主入口
 // ---------------------------------------------------------------------------
 void ameFsr1Present(int surfaceW, int surfaceH) {
     if (surfaceW <= 0 || surfaceH <= 0) return;
-    if (g_s.dead) return;
-    if (!ameFsr1Wanted()) return;
+    // 一次性状态转储：判定之前先把各道门的状态打出来。
+    // 此前每个早退分支都静默 —— 那正是「完全无效果却连一行日志都没有」的
+    // 直接成因。有了这一行，无论走哪条分支都能反推出是哪道门挡住的。
+    if (!g_entryLogged) {
+        g_entryLogged = YES;
+        NSLog(@"[FSR1] entry: surface=%dx%d wanted=%d dead=%d resolved=%d built=%d scale=%.3f",
+              surfaceW, surfaceH, (int)ameFsr1Wanted(), (int)g_s.dead,
+              (int)g_s.resolved, (int)g_s.built, ameFsr1Scale());
+    }
+
+    // 置死后只允许在 surface 几何变化时复活：本局的启动期瞬时故障
+    // （ANGLE 尚未建稳、MC 临时绑着离屏 FBO、上下文刚切换）不该让 FSR1 在
+    // 余下时间里彻底沉默。几何没变则本帧放弃上采样 —— 但必须先把左下角内容
+    // 铺满，否则画面永久缩在 surface 一角（surface 只创建一次，不会自愈）。
+    if (g_s.dead) {
+        if (g_s.deadW != surfaceW || g_s.deadH != surfaceH) {
+            NSLog(@"[FSR1] retry after geometry change: dead at %dx%d, now %dx%d",
+                  g_s.deadW, g_s.deadH, surfaceW, surfaceH);
+            g_s.dead = NO;
+            g_s.deadW = 0; g_s.deadH = 0;
+            g_s.logged = NO;
+        } else {
+            ameStretchToSurface(surfaceW, surfaceH);
+            return;
+        }
+    }
+    if (!ameFsr1Wanted()) {
+        // 开关关闭时 surface 本就与 viewport 同尺寸（ameFsr1NeedsFullResSurface
+        // 为假），这里通常无事可做；只有「运行中关掉开关而 surface 已按全分辨率
+        // 建好」时才需要把画面铺满，避免缩在一角。
+        ameStretchToSurface(surfaceW, surfaceH);
+        return;
+    }
 
     if (!g_s.resolved) {
         if (!ameResolveAll()) {
@@ -707,6 +892,9 @@ void ameFsr1Present(int surfaceW, int surfaceH) {
                 g_unresolvedLogged = YES;
                 NSLog(@"[FSR1] inactive: GL entry points unresolved (renderer not loaded yet?)");
             }
+            // 符号未解析时也必须铺满：surface 已按全分辨率建好，MC 仍在按低
+            // 分辨率绘制，静默返回会让画面缩在左下角。
+            ameStretchToSurface(surfaceW, surfaceH);
             return;
         }
         g_s.resolved = YES;
@@ -739,8 +927,7 @@ void ameFsr1Present(int surfaceW, int surfaceH) {
         g_s.renderW  != srcW     || g_s.renderH  != srcH) {
         if (!ameBuild(surfaceW, surfaceH, srcW, srcH)) {
             NSLog(@"[FSR1] disabled: resource setup failed");
-            g_s.dead = YES;
-            ameReleaseResources();
+            ameMarkDead(surfaceW, surfaceH);
             return;
         }
         if (!g_s.logged) {
@@ -785,8 +972,7 @@ void ameFsr1Present(int surfaceW, int surfaceH) {
 
     if (prevSamples > 1) {
         NSLog(@"[FSR1] disabled: window surface is multisampled (samples=%d)", prevSamples);
-        g_s.dead = YES;
-        ameReleaseResources();
+        ameMarkDead(surfaceW, surfaceH);
         aborted = YES;
     }
 
@@ -799,8 +985,7 @@ void ameFsr1Present(int surfaceW, int surfaceH) {
 
         if (ame_glGetError() != AME_GL_NO_ERROR) {
             NSLog(@"[FSR1] disabled: blit to render-resolution target failed");
-            g_s.dead = YES;
-            ameReleaseResources();
+            ameMarkDead(surfaceW, surfaceH);
             aborted = YES;
         }
     }
@@ -843,8 +1028,7 @@ void ameFsr1Present(int surfaceW, int surfaceH) {
     // 出错就自我关闭，绝不停在半截状态
     if (!aborted && ame_glGetError() != AME_GL_NO_ERROR) {
         NSLog(@"[FSR1] disabled: GL error during upscale pass");
-        g_s.dead = YES;
-        ameReleaseResources();
+        ameMarkDead(surfaceW, surfaceH);
     }
 
     // —— 恢复 GL 状态 ——
@@ -859,6 +1043,16 @@ void ameFsr1Present(int surfaceW, int surfaceH) {
     ame_glViewport(prevVp[0], prevVp[1], prevVp[2], prevVp[3]);
     // FSR1 自我关闭后，MC 下一帧仍会按低分辨率 viewport 画；此处留的是恢复值，
     // viewport 守护会在 swap 时把它对齐到 surface（ameFsr1RenderSize 已返回假）。
+}
+
+/// 只保证「画面铺满」，不做上采样。
+///
+/// 供 egl_bridge 在编译风暴等不适合多跑一趟全屏 pass 的时段调用：FSR1 的几何
+/// 前提（surface 全分辨率 + MC 低分辨率绘制）与是否上采样无关，只要本帧不上
+/// 采样就必须把左下角内容铺满，否则画面会缩在 surface 一角 —— 且 surface 只
+/// 创建一次，不会自愈。
+void ameFsr1KeepFullScreen(int surfaceW, int surfaceH) {
+    ameStretchToSurface(surfaceW, surfaceH);
 }
 
 void ameFsr1DumpState(void) {

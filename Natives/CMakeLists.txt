@@ -391,6 +391,7 @@ add_executable(AngelAuraAmethyst
   TrackedTextField.m
   egl_bridge.m
   fsr1/ame_fsr1.m
+  metalfx/ame_mfx.m
   ZinkConfig.m
   input_bridge_v3.m
   ios_uikit_bridge.m
@@ -583,11 +584,16 @@ target_link_libraries(AngelAuraAmethyst
   "-framework CoreMotion"
   "-framework GameController"
   "-framework IOKit"
+  "-framework Metal"
   "-framework QuartzCore"
   "-framework UIKit"
   "-framework UniformTypeIdentifiers"
   "-framework UnzipKit"
   "-framework WebKit"
+  # MetalFX 只有 iOS 16+ 才有，且本项目的部署目标可能更低，因此弱链接：
+  # 旧系统上 NSClassFromString 返回 nil，探针如实打印「class not found」，
+  # 不会因 dyld 找不见 framework 而在启动阶段崩掉。
+  "-weak_framework MetalFX"
   "-weak_framework SafariServices"
   ${TOUCHCONTROLLER_LIB}
   # Terracotta multiplayer 暂时移除：${TERRACOTTA_LIB} "-lc++" "-lresolv"

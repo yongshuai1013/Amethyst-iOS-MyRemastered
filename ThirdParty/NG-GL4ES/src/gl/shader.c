@@ -729,9 +729,23 @@ void APIENTRY_GL4ES gl4es_glShaderSource(GLuint shader, GLsizei count, const GLc
                         convertedSource = ConvertShaderBuiltInVariableOnly(
                             convertedSource, glshader->type == GL_VERTEX_SHADER ? 1 : 0, &glshader->need,
                             isBuiltInVariableConverted ? 0 : 1);
+                    // [fix/uaf] contains_glFragColor() 必须在 free() 之前读。
+                    // 原代码顺序是 free(glshader->source) 之后紧接着又把它交给
+                    // contains_glFragColor() 做 strstr —— 典型的 use-after-free。
+                    // 命中条件：片元着色器 && glsl_version>=140 && 版本兼容，
+                    // 即这条 (>=140 兼容) 分支下的 fragment shader。原版 MC 的
+                    // shader 走不进来，OptiFine/光影包的片元着色器正好落在这里，
+                    // 于是表现为"一开光影就崩在 _platform_strstr"（SIGSEGV
+                    // SEGV_ACCERR，栈顶 contains_glFragColor+0x68 <-
+                    // gl4es_glShaderSource+0x3fc）。
+                    // 修法：先把判断结果取出来，再释放；释放后置 NULL，避免后续
+                    // 任何残留读取再次踩到悬空指针（743 行会重新赋值）。
+                    int fragHasColor = (glshader->type == GL_FRAGMENT_SHADER) &&
+                                       contains_glFragColor(glshader->source);
                     free(glshader->source);
+                    glshader->source = NULL;
                     if (glshader->type == GL_FRAGMENT_SHADER) {
-                        if (contains_glFragColor(glshader->source)) {
+                        if (fragHasColor) {
                             convertedSource = replace_glFragColor(convertedSource);
                             convertedSource = insert_gl_FragColor_if_missing(convertedSource);
                         } else {

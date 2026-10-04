@@ -1689,6 +1689,78 @@ int launchJVM(NSString *accountId, id launchTarget, int width, int height, int m
             }
             NSLog(@"[JavaLauncher] Metallum agent enabled: -javaagent:metallum_agent.jar (mcVersion=%@)",
                   metallumMcVersionId);
+
+            // [MetalFX] 把设置页四个开关落盘成 metallum metalfx 侧唯一认的那份配置。
+            //
+            // 契约来自 metalfx 源码 MetalFxConfig（com.metallum.client.metal.fx）：
+            //   * 路径  <gameDir>/config/metallum_fx.properties
+            //           （= FabricLoader.getGameDir()/config/，与 -Duser.dir 同源）
+            //   * 键    spatialUpscaling / frameInterpolation / temporalUpscaling
+            //           / acknowledged
+            //   * 值    枚举名大写
+            // mod 只读这一个文件 —— 启动器没有 -D 通路，也没有别的注入点。此前四个
+            // 开关开了完全没反应，就是因为这一段从来没写：偏好存下来了，但没人把它
+            // 变成游戏侧能读到的配置文件。
+            //
+            // 关闭时必须删掉旧文件：否则用户上一轮开过、这一轮关掉，mod 仍按残留配置
+            // 启用 MetalFX，开关形同虚设（这正是"老设备不能被搞崩"要防的）。
+            {
+                // 注意：本文件顶部有 `#define fm NSFileManager.defaultManager`。
+                // 这里绝不能再写 `NSFileManager *fm = ...` —— 宏展开后
+                // `fm` 变成 `NSFileManager.defaultManager`，声明直接语法错误
+                // （曾导致 CI gmake exit 2）。直接用 fm 即可。
+                NSString *fxDir = [gameDir stringByAppendingPathComponent:@"config"];
+                NSString *fxPath = [fxDir stringByAppendingPathComponent:@"metallum_fx.properties"];
+                if (!getPrefBool(@"video.metalfx_enable")) {
+                    if ([fm fileExistsAtPath:fxPath]) {
+                        NSError *rmErr = nil;
+                        [fm removeItemAtPath:fxPath error:&rmErr];
+                        NSLog(@"[MetalFX] disabled: removed stale config %@ (err=%@)", fxPath, rmErr);
+                    }
+                } else {
+                    NSInteger spatialIdx = getPrefInt(@"video.metalfx_spatial");
+                    if (spatialIdx < 0 || spatialIdx > 4) spatialIdx = 0;
+                    // 顺序与 MetalFxConfig.SpatialMode 严格一一对应：
+                    // OFF(1.0) QUALITY(0.77) BALANCED(0.67) PERFORMANCE(0.56)
+                    // ULTRA_PERFORMANCE(0.33)
+                    NSString *spatial = @"OFF";
+                    if (spatialIdx == 1) {
+                        spatial = @"QUALITY";
+                    } else if (spatialIdx == 2) {
+                        spatial = @"BALANCED";
+                    } else if (spatialIdx == 3) {
+                        spatial = @"PERFORMANCE";
+                    } else if (spatialIdx == 4) {
+                        spatial = @"ULTRA_PERFORMANCE";
+                    }
+                    NSString *temporal = getPrefBool(@"video.metalfx_temporal") ? @"AUTO" : @"OFF";
+                    NSString *interp  = getPrefBool(@"video.metalfx_interpolation") ? @"AUTO" : @"OFF";
+                    // acknowledged=true：用户在启动器里主动开启即视为已知晓风险。
+                    // 否则 mod 的 MetalFxWarningScreen 会在游戏内弹一次确认框，iOS
+                    // 上触屏未必点得到，可能卡住主菜单。
+                    NSString *body = [NSString stringWithFormat:
+                        @"# Written by launcher (video.metalfx_*)\n"
+                        @"spatialUpscaling=%@\n"
+                        @"frameInterpolation=%@\n"
+                        @"temporalUpscaling=%@\n"
+                        @"acknowledged=true\n", spatial, interp, temporal];
+                    NSError *mkErr = nil;
+                    [fm createDirectoryAtPath:fxDir withIntermediateDirectories:YES
+                                   attributes:nil error:&mkErr];
+                    NSError *wrErr = nil;
+                    BOOL ok = [body writeToFile:fxPath atomically:YES
+                                       encoding:NSUTF8StringEncoding error:&wrErr];
+                    NSLog(@"[MetalFX] config %@ -> spatial=%@ temporal=%@ interpolation=%@ (mkErr=%@ wrErr=%@)",
+                          ok ? @"written" : @"WRITE FAILED", spatial, temporal, interp, mkErr, wrErr);
+                    // 时域超分是"替换"空间超分而非叠加：isTemporalUpscalingActive()
+                    // 要求 spatialMode.isEnabled()，spatial=OFF 时 temporal 空转。
+                    if (spatialIdx == 0 && ![temporal isEqualToString:@"OFF"]) {
+                        NSLog(@"[MetalFX] note: temporalUpscaling=%@ has no effect -- it replaces "
+                              @"(not stacks on) spatial upscaling, so it needs a non-OFF spatial mode",
+                              temporal);
+                    }
+                }
+            }
         } else {
             NSLog(@"[JavaLauncher] Metallum agent skipped: MC major %ld < 26 (agent needs Java 21+ class files, this session runs Java 8)",
                   (long)metallumMcMajor);

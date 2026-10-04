@@ -19,17 +19,49 @@ jobs:
           - platform: 2
             platform_name: ios
 
-    runs-on: macos-14
+    runs-on: macos-15
 
     # 发布 nightly release 需要 contents: write
     permissions:
       contents: write
 
     steps:
-      - name: Select Xcode 15.4
+      - name: Select Xcode (prefer 26+ for iOS 26 Liquid Glass, fallback 15.4)
         run: |
-          sudo xcode-select -s /Applications/Xcode_15.4.app/Contents/Developer
+          echo "== 可用 Xcode =="
+          ls -d /Applications/Xcode*.app 2>/dev/null || true
+          echo "== 默认 =="
           xcodebuild -version || true
+          # 选最新的 Xcode ≥ 26(液态玻璃需要 iOS 26 SDK);找不到就退 15.4。
+          PICK=""
+          for app in $(ls -d /Applications/Xcode_26*.app 2>/dev/null | sort -V -r); do
+            PICK="$app"; break
+          done
+          if [ -z "$PICK" ]; then
+            for app in $(ls -d /Applications/Xcode*.app 2>/dev/null | sort -V -r); do
+              v=$(basename "$app" | sed -E 's/Xcode_?([0-9]+).*/\1/')
+              if [ -n "$v" ] && [ "$v" -ge 26 ] 2>/dev/null; then PICK="$app"; break; fi
+            done
+          fi
+          if [ -n "$PICK" ]; then
+            sudo xcode-select -s "$PICK/Contents/Developer"
+            echo "★ 选用 $PICK"
+          else
+            sudo xcode-select -s /Applications/Xcode_15.4.app/Contents/Developer
+            echo "★ 未找到 Xcode 26,回退 15.4(本包不含 iOS 26 新外观)"
+          fi
+          xcodebuild -version || true
+          SDK=$(xcrun --sdk iphoneos --show-sdk-version 2>/dev/null || echo '?')
+          SDKPATH_REAL=$(xcrun --sdk iphoneos --show-sdk-path 2>/dev/null || echo '')
+          echo "★ iPhoneOS SDK = $SDK"
+          echo "★ SDKPATH = $SDKPATH_REAL"
+          # ★ 关键:Makefile 里是 SDKPATH ?= ...(?= 不覆盖已有值),
+          #   若环境里带着旧的 SDKPATH,或者 CMake 缓存了旧 CMAKE_OSX_SYSROOT,
+          #   就会【用旧 SDK 编译】—— 那样打包出来的 App 拿不到 iOS 26 新外观。
+          #   这里显式写入 GITHUB_ENV,强制后续所有步骤用同一个 SDK。
+          echo "SDKPATH=$SDKPATH_REAL" >> "$GITHUB_ENV"
+          echo "DEVELOPER_DIR=$(xcode-select -p)" >> "$GITHUB_ENV"
+          echo "★ 已写入 GITHUB_ENV:SDKPATH / DEVELOPER_DIR"
 
       - name: Install GNU Make
         run: |
@@ -106,17 +138,49 @@ jobs:
           export BUILD_MOBILEGL="${BUILD_MOBILEGL:-1}"
           echo "[ci] BUILD_MOBILEGL=${BUILD_MOBILEGL} vars=${{ vars.BUILD_MOBILEGL }} src=$(test -d Natives/external/MobileGL && echo yes || echo no)"
 
-          if [ "${{ matrix.platform_name }}" == "ios" ]; then
-            gmake -j$(sysctl -n hw.ncpu) dsym package PLATFORM=${{ matrix.platform }}
+          # gmake 的完整输出同时落盘：CI 的 job log 与 artifact 走 blob storage，
+          # 外部（以及本仓库的协作者）取不回来，编译错误只能靠猜。
+          # 配合下面 "Publish iOS build log to repo" 步骤，失败时把这份日志
+          # 提交回仓库（raw 可读），直接定位到出错的文件与行号。
+          # pipefail 已在上面开启，gmake 的非零退出码仍能经 tee 传播。
+          mkdir -p ci-logs
+          which gmake || echo "[ci] WARNING: gmake not on PATH"
+          gmake --version 2>&1 | head -1 || echo "[ci] WARNING: gmake --version failed"
 
-            gmake -j$(sysctl -n hw.ncpu) dsym package PLATFORM=${{ matrix.platform }} TROLLSTORE_JIT_ENT=1
+          if [ "${{ matrix.platform_name }}" == "ios" ]; then
+            gmake -j$(sysctl -n hw.ncpu) dsym package PLATFORM=${{ matrix.platform }} 2>&1 | tee ci-logs/ios-build.log
+
+            gmake -j$(sysctl -n hw.ncpu) dsym package PLATFORM=${{ matrix.platform }} TROLLSTORE_JIT_ENT=1 2>&1 | tee ci-logs/ios-build-trollstore.log
 
           elif [ "${{ matrix.platform_name }}" == "tvos" ]; then
-            gmake -j$(sysctl -n hw.ncpu) dsym package PLATFORM=${{ matrix.platform }} TROLLSTORE_JIT_ENT=1
+            gmake -j$(sysctl -n hw.ncpu) dsym package PLATFORM=${{ matrix.platform }} TROLLSTORE_JIT_ENT=1 2>&1 | tee ci-logs/tvos-build.log
 
           else
-            gmake -j$(sysctl -n hw.ncpu) dsym package PLATFORM=${{ matrix.platform }}
+            gmake -j$(sysctl -n hw.ncpu) dsym package PLATFORM=${{ matrix.platform }} 2>&1 | tee ci-logs/build.log
           fi
+
+      - name: Surface iOS build errors as check annotations
+        # 主构建（gmake dsym package）的真实编译错误只存在于 job log，而 job log
+        # 与 artifact 走 blob storage，外部（含协作者）取不回来，此前只能靠猜。
+        # 这里把日志里的 error 行以 workflow command 写成 check annotation：
+        # 之后经 check-runs annotations API 就能直接读到出错的文件与行号。
+        # 单条 annotation 用 %0A 拼接多行，避免被"每级 10 条"的上限截断。
+        if: matrix.platform_name == 'ios' && always()
+        continue-on-error: true
+        run: |
+          LOG=ci-logs/ios-build.log
+          [ -f "$LOG" ] || LOG=ci-logs/ios-build-trollstore.log
+          if [ ! -f "$LOG" ]; then echo "[ci] no ios build log captured"; exit 0; fi
+          echo "[ci] build log: $LOG ($(wc -l < "$LOG") lines)"
+          esc() { sed -e 's/%/%25/g' -e 's/\r/%0D/g'; }
+          MSG=$(grep -nE "error:|fatal error:|Undefined symbols|duplicate symbol|ld: |clang: |No rule to make target|\*\*\* " "$LOG" | head -25 | esc | awk '{printf "%s%%0A", $0}')
+          if [ -n "$MSG" ]; then
+            echo "::error title=build-errors::$MSG"
+          else
+            echo "::error title=build-errors::(no error: line matched -- see tail)"
+          fi
+          TAIL=$(tail -20 "$LOG" | esc | awk '{printf "%s%%0A", $0}')
+          echo "::error title=build-tail::$TAIL"
 
       - name: Upload MobileGL dylib (if built)
         # MobileGL 从源码编译，产物在 Natives/build/ 下。单独上传一份，
@@ -201,6 +265,26 @@ jobs:
           path: mobilegl-build.log
           if-no-files-found: ignore
 
+      - name: Publish iOS build log to repo (diagnosis)
+        # 主构建（gmake dsym package）失败时，真实编译错误只在 job log 里。
+        # 与 SFPEW 那条同理：blob storage 取不回来，所以把 tee 下来的日志
+        # 提交回仓库，raw 直读即可定位到出错文件/行号，不必再手工下载产物。
+        if: matrix.platform_name == 'ios' && always() && failure()
+        continue-on-error: true
+        run: |
+          set -e
+          if [ ! -f ci-logs/ios-build.log ] && [ ! -f ci-logs/ios-build-trollstore.log ]; then
+            echo "[ci] no ios build log captured -- gmake did not start"; exit 0
+          fi
+          BRANCH_NAME="${GITHUB_REF#refs/heads/}"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -f ci-logs/ios-build.log ci-logs/ios-build-trollstore.log 2>/dev/null || true
+          if git diff --cached --quiet; then exit 0; fi
+          git commit -m "ci(ios): 提交主构建日志用于定位 [skip ci]"
+          git pull --rebase origin "$BRANCH_NAME" || true
+          git push origin HEAD:"$BRANCH_NAME" || true
+
       - name: Publish SFPEW build log to repo (diagnosis)
         # dep_sfpew 用 `-$(MAKE)` 调用，失败不阻断主构建，失败细节会被静默吞掉；
         # 而 CI 的 job log / artifact 走 blob storage，外部取不回来。
@@ -218,7 +302,7 @@ jobs:
           cp Natives/build/sfpew_build.log ci-logs/sfpew-build.log
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add ci-logs/sfpew-build.log
+          git add -f ci-logs/sfpew-build.log
           if git diff --cached --quiet; then exit 0; fi
           git commit -m "ci(sfpew): 提交构建日志用于定位 [skip ci]"
           git push origin HEAD:"$BRANCH_NAME" || { git pull --rebase origin "$BRANCH_NAME"; git push origin HEAD:"$BRANCH_NAME"; }

@@ -1,5 +1,6 @@
 #import "SurfaceViewController.h"
 #import "fsr1/ame_fsr1.h"
+#import "metalfx/ame_mfx.h"
 
 #include "jni.h"
 #include <assert.h>
@@ -971,6 +972,11 @@ void pojavSwapBuffers() {
     }
 
     if (!br_swap_buffers) return;
+
+    // MetalFX 能力探针（阶段 0）：只在首次真正要走 swap 时跑一次 —— 此时 EGL
+    // 上下文已就绪，能拿到 EGLDisplay 去查 ANGLE 的 Metal 互操作扩展。
+    // 纯打印，不建资源、不改渲染行为；探测结果决定后续能否做 MetalFX 超分。
+    ameMfxProbe();
 
     // 启动器侧 FSR1：present 之前把渲染分辨率的内容上采样铺满 surface。
     // 位置必须在 viewport 守护之后 —— 守护保证当前 viewport 等于渲染分辨率，
